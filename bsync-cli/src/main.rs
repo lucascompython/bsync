@@ -241,7 +241,6 @@ async fn dispatch_effect(
     match effect {
         BsyncEffect::WriteClipboard { content, .. } => {
             if let Some(ctx) = clipboard_ctx {
-                println!("(remote) Writing to clipboard: {content}");
                 ctx.set_text(content).ok();
             }
         }

@@ -12,7 +12,7 @@ path = "src/main.rs"
 bsync-core = { path = "../bsync-core" }
 iroh = "=1.0.0"
 iroh-gossip = "=0.101.0"
-clipboard-rs = "0.3"
+clipboard-rs = { version = "0.3", features = ["wayland"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "signal", "macros", "io-util", "time"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

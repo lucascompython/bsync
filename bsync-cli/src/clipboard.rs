@@ -45,7 +45,6 @@ struct WatcherHandler {
 impl ClipboardHandler for WatcherHandler {
     fn on_clipboard_change(&mut self) {
         if let Ok(text) = self.ctx.get_text() {
-            println!("(local) Clipboard changed: {text}");
             let _ = self.tx.blocking_send(text);
         }
     }
