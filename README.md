@@ -30,6 +30,8 @@ Wire up the UI frontends, add features like selective sync, file transfer, end-t
 - svelte
 - swiftui
 - jetpack compose
+- gtk
+- ratatui
 
 ### Architecture reviews
 
