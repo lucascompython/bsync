@@ -1,11 +1,5 @@
-// bsync-core — pure logic core for bsync.
-// ZERO I/O dependencies: no clipboard-rs, no arboard, no iroh.
-// Only BsyncEvent / BsyncEffect cross the FFI boundary.
-
 use std::collections::VecDeque;
-use std::time::Instant;
-
-// ── Constants ─────────────────────────────────────────────────
+use std::time::{Instant, SystemTime};
 
 /// Maximum size of a serialized gossip message (1 MB).
 pub const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
@@ -13,7 +7,13 @@ pub const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
 /// Maximum clipboard broadcasts per second (rate limit).
 const MAX_BROADCASTS_PER_SEC: usize = 4;
 
-// ── Config ────────────────────────────────────────────────────
+/// How many clipboard entries to keep in history.
+const HISTORY_CAPACITY: usize = 50;
+/// Truncate preview text to this many characters in history entries.
+const HISTORY_PREVIEW_LEN: usize = 100;
+
+/// Current ticket format version. Bump when the wire format changes.
+pub const TICKET_VERSION: u8 = 1;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -24,8 +24,6 @@ pub struct Config {
     /// Skip peer approval prompts (dangerous for clipboard data).
     pub auto_accept: bool,
 }
-
-// ── Ticket ────────────────────────────────────────────────────
 
 /// Versioned ticket for peer bootstrap. Base64-encoded JSON.
 /// Contains only public info — EndpointId + room name. NOT a secret.
@@ -39,7 +37,7 @@ pub struct Ticket {
 impl Ticket {
     pub fn new(endpoint_addr: String, room: String) -> Self {
         Self {
-            v: 1,
+            v: TICKET_VERSION,
             endpoint_addr,
             room,
         }
@@ -59,7 +57,7 @@ impl Ticket {
             .decode(encoded)
             .map_err(|_| TicketError::InvalidEncoding)?;
         let ticket: Self = serde_json::from_slice(&bytes).map_err(|_| TicketError::InvalidJson)?;
-        if ticket.v != 1 {
+        if ticket.v != TICKET_VERSION {
             return Err(TicketError::UnsupportedVersion(ticket.v));
         }
         Ok(ticket)
@@ -76,8 +74,6 @@ pub enum TicketError {
     UnsupportedVersion(u8),
 }
 
-// ── Gossip Message ────────────────────────────────────────────
-
 /// Wire protocol message. `origin` is required because iroh-gossip's
 /// `delivered_from` is the forwarding neighbor, not the original author.
 /// Enum from day one — adding variants is non-breaking.
@@ -85,8 +81,6 @@ pub enum TicketError {
 pub enum GossipMessage {
     ClipboardText { origin: String, content: String },
 }
-
-// ── Events ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub enum BsyncEvent {
@@ -110,8 +104,6 @@ pub enum BsyncEvent {
     Shutdown,
 }
 
-// ── Effects ───────────────────────────────────────────────────
-
 #[derive(Debug)]
 pub enum BsyncEffect {
     /// Shell writes content to local clipboard. `write_hash` is for echo guard.
@@ -131,18 +123,29 @@ pub enum BsyncEffect {
     Shutdown,
 }
 
-// ── View Model ────────────────────────────────────────────────
+/// A single entry in the clipboard history.
+#[derive(Debug, Clone)]
+pub struct ClipboardHistoryEntry {
+    /// Truncated preview of the clipboard content.
+    pub preview: String,
+    /// Whether this originated locally (true) or from a remote peer (false).
+    pub is_local: bool,
+    /// Peer ID of the origin (equals our peer_id for local copies).
+    pub origin: String,
+    /// When this entry was recorded (system time, for display).
+    pub timestamp: SystemTime,
+}
 
 #[derive(Debug, Clone)]
 pub struct BsyncViewModel {
     pub peer_id: String,
     pub ticket: String,
+    pub room: String,
     pub connected_peers: Vec<String>,
     pub pending_peers: Vec<String>,
     pub status: String,
+    pub history: Vec<ClipboardHistoryEntry>,
 }
-
-// ── Core ──────────────────────────────────────────────────────
 
 pub struct BsyncCore {
     peer_id: String,
@@ -156,6 +159,8 @@ pub struct BsyncCore {
     pending_write_hash: Option<blake3::Hash>,
     /// Timestamps of recent broadcasts (rate limiting).
     broadcast_times: VecDeque<Instant>,
+    /// Ring buffer of recent clipboard entries (newest first).
+    history: VecDeque<ClipboardHistoryEntry>,
     status: String,
 }
 
@@ -170,6 +175,7 @@ impl BsyncCore {
             last_applied_hash: None,
             pending_write_hash: None,
             broadcast_times: VecDeque::with_capacity(MAX_BROADCASTS_PER_SEC),
+            history: VecDeque::with_capacity(HISTORY_CAPACITY),
             status: String::new(),
         }
     }
@@ -196,13 +202,13 @@ impl BsyncCore {
         BsyncViewModel {
             peer_id: self.peer_id.clone(),
             ticket: Ticket::new(self.peer_id.clone(), self.room.clone()).encode(),
+            room: self.room.clone(),
             connected_peers: self.connected_peers.clone(),
             pending_peers: self.pending_peers.clone(),
             status: self.status.clone(),
+            history: self.history.iter().rev().cloned().collect(),
         }
     }
-
-    // ── Event handlers ────────────────────────────────────────
 
     fn handle_start(&mut self) -> Vec<BsyncEffect> {
         let ticket = Ticket::new(self.peer_id.clone(), self.room.clone()).encode();
@@ -234,6 +240,10 @@ impl BsyncCore {
             self.pending_write_hash = None;
             return vec![];
         }
+
+        // Record in history regardless of rate limiting.
+        let origin = self.peer_id.clone();
+        self.push_history(content.clone(), &origin, true);
 
         // Rate limit: at most MAX_BROADCASTS_PER_SEC broadcasts per second.
         self.prune_broadcast_times();
@@ -268,6 +278,7 @@ impl BsyncCore {
 
         self.last_applied_hash = Some(hash);
         self.pending_write_hash = Some(hash); // Set echo guard
+        self.push_history(content.clone(), &from, false);
 
         vec![BsyncEffect::WriteClipboard {
             content,
@@ -339,6 +350,31 @@ impl BsyncCore {
         {
             self.broadcast_times.pop_front();
         }
+    }
+
+    /// Push a clipboard entry to history, evicting oldest if at capacity.
+    fn push_history(&mut self, content: String, origin: &str, is_local: bool) {
+        let preview: String = if content.chars().count() > HISTORY_PREVIEW_LEN {
+            format!(
+                "{}\u{2026}",
+                content
+                    .chars()
+                    .take(HISTORY_PREVIEW_LEN)
+                    .collect::<String>()
+            )
+        } else {
+            content
+        };
+        let entry = ClipboardHistoryEntry {
+            preview,
+            is_local,
+            origin: origin.to_string(),
+            timestamp: SystemTime::now(),
+        };
+        if self.history.len() >= HISTORY_CAPACITY {
+            self.history.pop_front();
+        }
+        self.history.push_back(entry);
     }
 }
 
@@ -544,5 +580,66 @@ mod tests {
             effects.is_empty(),
             "messages from rejected peers must be dropped"
         );
+    }
+
+    #[test]
+    fn history_records_local_and_remote() {
+        let mut core = test_core();
+        connect_peer(&mut core, "peer-2");
+
+        // Local copy
+        core.process_event(BsyncEvent::LocalClipboardChanged {
+            content: "local text".into(),
+        });
+
+        // Remote receive
+        core.process_event(BsyncEvent::RemoteMessageReceived {
+            from: "peer-2".into(),
+            content: "remote text".into(),
+        });
+
+        let view = core.view();
+        assert_eq!(view.history.len(), 2);
+
+        // Newest first (reversed from internal deque)
+        assert_eq!(view.history[0].preview, "remote text");
+        assert!(!view.history[0].is_local);
+        assert_eq!(view.history[0].origin, "peer-2");
+
+        assert_eq!(view.history[1].preview, "local text");
+        assert!(view.history[1].is_local);
+        assert_eq!(view.history[1].origin, "test-peer-1");
+    }
+
+    #[test]
+    fn history_truncates_long_content() {
+        let mut core = test_core();
+        let long = "x".repeat(200);
+        core.process_event(BsyncEvent::LocalClipboardChanged { content: long });
+
+        let view = core.view();
+        assert_eq!(view.history.len(), 1);
+        assert!(view.history[0].preview.ends_with('\u{2026}'));
+        assert!(view.history[0].preview.chars().count() <= 101); // 100 + ellipsis
+    }
+
+    #[test]
+    fn history_caps_at_max_entries() {
+        let mut core = test_core();
+        for i in 0..60 {
+            core.process_event(BsyncEvent::LocalClipboardChanged {
+                content: format!("item {i}"),
+            });
+        }
+        let view = core.view();
+        assert_eq!(view.history.len(), 50);
+    }
+
+    #[test]
+    fn view_includes_room() {
+        let core = test_core();
+        let view = core.view();
+        assert_eq!(view.room, "test-room");
+        assert!(!view.ticket.is_empty());
     }
 }

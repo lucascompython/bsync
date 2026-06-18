@@ -1,3 +1,3 @@
 [workspace]
 resolver = "2"
-members = ["bsync-core", "bsync-cli"]
+members = ["bsync-core", "bsync-rust", "bsync-tui"]

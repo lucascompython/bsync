@@ -1,9 +1,9 @@
-// iroh endpoint + gossip setup, topic derivation, and run loop helpers.
+// iroh endpoint + gossip setup, topic derivation.
 
 use anyhow::Context;
 use iroh::{endpoint::presets, protocol::Router, Endpoint, EndpointId, SecretKey};
 use iroh_gossip::{
-    api::{GossipSender, GossipReceiver},
+    api::{GossipReceiver, GossipSender},
     Gossip, TopicId,
 };
 
@@ -24,7 +24,6 @@ pub struct GossipHandle {
 }
 
 /// Set up the iroh endpoint, gossip protocol, and subscribe to the topic.
-/// Returns a handle that owns all resources.
 pub async fn setup(
     room: &str,
     secret_key: &SecretKey,
@@ -57,12 +56,6 @@ pub async fn setup(
         sender,
         receiver,
     })
-}
-
-/// Wait until at least one peer has joined the swarm.
-#[allow(dead_code)]
-pub async fn wait_for_peer(receiver: &mut GossipReceiver) -> anyhow::Result<()> {
-    receiver.joined().await.context("timed out waiting for peer join")
 }
 
 /// Parse an endpoint address string into an EndpointId for bootstrapping.

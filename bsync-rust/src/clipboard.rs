@@ -6,30 +6,18 @@ use clipboard_rs::{
 };
 
 /// Start the clipboard watcher in a background thread.
-/// Sends detected text changes through `tx`. Returns immediately.
 pub fn start_watcher(tx: tokio::sync::mpsc::Sender<String>) {
     std::thread::spawn(move || {
         let ctx = match ClipboardContext::new() {
             Ok(c) => c,
-            Err(e) => {
-                eprintln!("Failed to create clipboard context: {e}");
-                eprintln!(
-                    "If you're on Wayland, ensure your compositor supports \
-                     wlr-data-control or ext-data-control-v1."
-                );
-                eprintln!("Try running with --no-clipboard to disable clipboard sync.");
-                return;
-            }
+            Err(_) => return,
         };
 
         let handler = WatcherHandler { ctx, tx };
 
         let mut watcher = match ClipboardWatcherContext::new() {
             Ok(w) => w,
-            Err(e) => {
-                eprintln!("Failed to start clipboard watcher: {e}");
-                return;
-            }
+            Err(_) => return,
         };
 
         let _shutdown = watcher.add_handler(handler).get_shutdown_channel();

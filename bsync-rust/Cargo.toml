@@ -1,0 +1,18 @@
+[package]
+name = "bsync-rust"
+version = "0.1.0"
+edition = "2021"
+description = "Shared Rust platform implementation for bsync shells (identity, gossip, clipboard)"
+
+[lib]
+name = "bsync_rust"
+path = "src/lib.rs"
+
+[dependencies]
+iroh = "=1.0.0"
+iroh-gossip = "=0.101.0"
+clipboard-rs = { version = "0.3", features = ["wayland"] }
+tokio = { version = "1", features = ["sync", "fs"] }
+anyhow = "1"
+dirs = "6"
+blake3 = "1"

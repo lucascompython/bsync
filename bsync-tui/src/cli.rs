@@ -1,80 +1,28 @@
-// bsync — P2P clipboard sync CLI.
-//
-// Architecture: main.rs is the shell loop. All state lives in BsyncCore.
-// Clipboard watching, gossip I/O, and stdin prompts happen here.
-// The core has zero I/O dependencies — only BsyncEvent / BsyncEffect cross.
-
-mod clipboard;
-mod gossip;
-mod identity;
-
 use anyhow::Context;
 use bsync_core::{
     BsyncCore, BsyncEffect, BsyncEvent, Config, GossipMessage, Ticket, MAX_MESSAGE_SIZE,
 };
-use clap::Parser;
+use bsync_rust::{clipboard, gossip, identity};
 use clipboard_rs::Clipboard;
 use futures_lite::StreamExt;
 use iroh_gossip::api::Event;
+use tokio::sync::mpsc;
 
-// ── Startup warning (printed on every launch) ─────────────────
+type CliArgs = crate::Cli;
 
-const STARTUP_WARNING: &str = "\
-\u{26a0}\u{fe0f}  bsync sends your clipboard contents to ALL connected peers.
-    Only connect to peers you trust completely.
-    Connected peers can see: passwords, 2FA codes, API keys, private text.
-";
-
-// ── CLI ───────────────────────────────────────────────────────
-
-#[derive(Parser)]
-#[command(name = "bsync", version, about = "P2P clipboard sync")]
-struct Cli {
-    /// Connect to a peer using their ticket
-    #[arg(short, long)]
-    connect: Option<String>,
-
-    /// Room name for logical isolation (default: "default")
-    #[arg(long, default_value = "default")]
-    room: String,
-
-    /// Disable clipboard watching/writing (network-only mode)
-    #[arg(long)]
-    no_clipboard: bool,
-
-    /// Skip peer approval prompt (dangerous for clipboard data)
-    #[arg(long)]
-    auto_accept: bool,
-}
-
-// ── Entry point ───────────────────────────────────────────────
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-    run(cli).await
-}
-
-async fn run(cli: Cli) -> anyhow::Result<()> {
-    // ── Startup warning ──────────────────────────────────
-    eprintln!("{STARTUP_WARNING}");
-
-    // ── Identity ─────────────────────────────────────────
+pub async fn run(cli: &CliArgs) -> anyhow::Result<()> {
     let (secret_key, peer_id_str) = identity::load_or_create_key().await?;
 
-    // ── Core ─────────────────────────────────────────────
     let mut core = BsyncCore::new(Config {
         peer_id: peer_id_str,
         room: cli.room.clone(),
         auto_accept: cli.auto_accept,
     });
 
-    // Print peer ID + ticket
     for effect in core.process_event(BsyncEvent::StartEndpoint) {
         print_effect(&effect);
     }
 
-    // ── Gossip setup ─────────────────────────────────────
     let mut bootstrap = Vec::new();
     if let Some(ticket_str) = &cli.connect {
         match Ticket::decode(ticket_str) {
@@ -100,7 +48,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
     let mut gh = gossip::setup(&cli.room, &secret_key, bootstrap).await?;
 
-    // ── Clipboard ────────────────────────────────────────
     let clipboard_ctx: Option<clipboard_rs::ClipboardContext> = if !cli.no_clipboard {
         match clipboard_rs::ClipboardContext::new() {
             Ok(ctx) => Some(ctx),
@@ -117,20 +64,17 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         None
     };
 
-    let (clipboard_tx, mut clipboard_rx) = tokio::sync::mpsc::channel::<String>(32);
+    let (clipboard_tx, mut clipboard_rx) = mpsc::channel::<String>(32);
     if clipboard_ctx.is_some() {
         clipboard::start_watcher(clipboard_tx);
     }
 
-    // ── Approval channel ─────────────────────────────────
-    let (approval_tx, mut approval_rx) = tokio::sync::mpsc::unbounded_channel::<(String, bool)>();
+    let (approval_tx, mut approval_rx) = mpsc::unbounded_channel::<(String, bool)>();
 
     println!("Waiting for connections...");
 
-    // ── Main event loop ──────────────────────────────────
     loop {
         tokio::select! {
-            // ── Clipboard change ──────────────────────
             Some(content) = clipboard_rx.recv() => {
                 let effects = core.process_event(BsyncEvent::LocalClipboardChanged { content });
                 for effect in effects {
@@ -138,16 +82,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 }
             }
 
-            // ── Gossip event ──────────────────────────
             result = gh.receiver.next() => {
                 match result {
-                    Some(Ok(event)) => handle_gossip_event(
-                        event,
-                        &mut core,
-                        &gh.sender,
-                        &clipboard_ctx,
-                        &approval_tx,
-                    ).await?,
+                    Some(Ok(event)) => {
+                        handle_gossip_event(event, &mut core, &gh.sender, &clipboard_ctx, &approval_tx).await?;
+                    }
                     Some(Err(e)) => {
                         eprintln!("Gossip error: {e}");
                     }
@@ -158,19 +97,18 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 }
             }
 
-            // ── Approval response ──────────────────────
             Some((peer_id, approved)) = approval_rx.recv() => {
                 let event = if approved {
                     BsyncEvent::PeerApproved { id: peer_id }
                 } else {
                     BsyncEvent::PeerRejected { id: peer_id }
                 };
-                for effect in core.process_event(event) {
+                let effects = core.process_event(event);
+                for effect in effects {
                     dispatch_effect(effect, &gh.sender, &clipboard_ctx, &approval_tx).await?;
                 }
             }
 
-            // ── Ctrl+C ─────────────────────────────────
             _ = tokio::signal::ctrl_c() => {
                 println!("\nShutting down...");
                 let effects = core.process_event(BsyncEvent::Shutdown);
@@ -182,19 +120,16 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
     }
 
-    // ── Cleanup ─────────────────────────────────────────
     gh.router.shutdown().await.context("shutdown router")?;
     Ok(())
 }
-
-// ── Gossip event handler ──────────────────────────────────────
 
 async fn handle_gossip_event(
     event: Event,
     core: &mut BsyncCore,
     sender: &iroh_gossip::api::GossipSender,
     clipboard_ctx: &Option<clipboard_rs::ClipboardContext>,
-    approval_tx: &tokio::sync::mpsc::UnboundedSender<(String, bool)>,
+    approval_tx: &mpsc::UnboundedSender<(String, bool)>,
 ) -> anyhow::Result<()> {
     match event {
         Event::Received(msg) => match serde_json::from_slice::<GossipMessage>(&msg.content) {
@@ -230,13 +165,11 @@ async fn handle_gossip_event(
     Ok(())
 }
 
-// ── Effect dispatch ───────────────────────────────────────────
-
 async fn dispatch_effect(
     effect: BsyncEffect,
     sender: &iroh_gossip::api::GossipSender,
     clipboard_ctx: &Option<clipboard_rs::ClipboardContext>,
-    approval_tx: &tokio::sync::mpsc::UnboundedSender<(String, bool)>,
+    approval_tx: &mpsc::UnboundedSender<(String, bool)>,
 ) -> anyhow::Result<()> {
     match effect {
         BsyncEffect::WriteClipboard { content, .. } => {
@@ -272,13 +205,8 @@ async fn dispatch_effect(
             });
         }
 
-        BsyncEffect::ConnectToEndpoint { .. } => {
-            // Handled at startup — ignored during runtime.
-        }
-
-        BsyncEffect::Shutdown => {
-            // Cleanup handled after event loop exit.
-        }
+        BsyncEffect::ConnectToEndpoint { .. } => {}
+        BsyncEffect::Shutdown => {}
     }
 
     Ok(())

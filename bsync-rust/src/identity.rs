@@ -36,7 +36,6 @@ async fn create_key(
 ) -> anyhow::Result<(SecretKey, String)> {
     let secret_key = SecretKey::generate();
 
-    // Create config directory with 0o700 permissions
     tokio::fs::create_dir_all(config_dir)
         .await
         .context("failed to create config directory")?;
@@ -49,7 +48,6 @@ async fn create_key(
             .context("failed to set config directory permissions")?;
     }
 
-    // Write key with 0o600 permissions
     let key_bytes = secret_key.to_bytes();
     tokio::fs::write(key_path, &key_bytes)
         .await
