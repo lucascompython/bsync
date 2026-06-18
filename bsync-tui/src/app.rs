@@ -1,4 +1,5 @@
-use bsync_core::{BsyncCore, BsyncViewModel};
+use bsync_core::{BsyncCore, BsyncViewModel, BsyncEffect, BsyncEvent, Ticket};
+use clipboard_rs::Clipboard;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -31,16 +32,11 @@ impl Tab {
     }
 }
 
-/// Modal dialog overlay state.
 #[derive(Debug, Clone)]
 pub enum Dialog {
-    /// Peer approval prompt.
     Approval { peer_id: String },
-    /// Ticket input for connecting to a peer.
     ConnectInput { input: String },
-    /// Error message display.
     Error { message: String },
-    /// Info message display.
     Info { message: String },
 }
 
@@ -50,12 +46,14 @@ pub struct App {
     pub history_scroll: usize,
     pub dialog: Option<Dialog>,
     pub should_quit: bool,
-    /// Clipboard context for writing (None if --no-clipboard).
     pub clipboard_enabled: bool,
+    pub clipboard_ctx: Option<clipboard_rs::ClipboardContext>,
+    pub gossip: Option<iroh_gossip::Gossip>,
+    pub room: String,
 }
 
 impl App {
-    pub fn new(core: BsyncCore) -> Self {
+    pub fn new(core: BsyncCore, room: String) -> Self {
         Self {
             core,
             tab: Tab::Status,
@@ -63,6 +61,9 @@ impl App {
             dialog: None,
             should_quit: false,
             clipboard_enabled: true,
+            clipboard_ctx: None,
+            gossip: None,
+            room,
         }
     }
 
@@ -92,5 +93,81 @@ impl App {
         self.dialog = Some(Dialog::ConnectInput {
             input: String::new(),
         });
+    }
+
+    pub fn copy_ticket_to_clipboard(&mut self) {
+        if let Some(ctx) = &self.clipboard_ctx {
+            let ticket = self.view().ticket;
+            let _ = ctx.set_text(ticket);
+            self.dialog = Some(Dialog::Info {
+                message: "Ticket copied to clipboard.".into(),
+            });
+        } else {
+            self.dialog = Some(Dialog::Error {
+                message: "Clipboard is disabled (--no-clipboard).".into(),
+            });
+        }
+    }
+
+    pub fn recopy_history_item(&mut self) {
+        let view = self.view();
+        if view.history.is_empty() {
+            return;
+        }
+        let idx = self.history_scroll.min(view.history.len() - 1);
+        if let Some(entry) = view.history.get(idx) {
+            if let Some(ctx) = &self.clipboard_ctx {
+                let _ = ctx.set_text(entry.content.clone());
+                self.dialog = Some(Dialog::Info {
+                    message: format!("Copied to clipboard: {}", &entry.preview[..entry.preview.len().min(40)]),
+                });
+            }
+        }
+    }
+
+    pub async fn connect_to_peer(&mut self, ticket_str: String) {
+        match Ticket::decode(&ticket_str) {
+            Ok(ticket) => {
+                let endpoint_addr = ticket.endpoint_addr.clone();
+                let room = ticket.room.clone();
+
+                let effects = self
+                    .core
+                    .process_event(BsyncEvent::ConnectToPeer { ticket: ticket_str });
+
+                for effect in effects {
+                    if let BsyncEffect::ConnectToEndpoint { .. } = effect {
+                        match bsync_rust::gossip::parse_endpoint_addr(&endpoint_addr) {
+                            Ok(peer_id) => {
+                                if let Some(gossip) = &self.gossip {
+                                    let topic = bsync_rust::gossip::derive_topic(&self.room);
+                                    let _ = gossip.subscribe(topic, vec![peer_id]).await;
+
+                                    self.dialog = Some(Dialog::Info {
+                                        message: format!(
+                                            "Connecting to peer in room '{room}'...\nThe other peer must be in the same room.",
+                                        ),
+                                    });
+                                } else {
+                                    self.dialog = Some(Dialog::Error {
+                                        message: "Gossip not initialized.".into(),
+                                    });
+                                }
+                            }
+                            Err(e) => {
+                                self.dialog = Some(Dialog::Error {
+                                    message: format!("Invalid endpoint address: {e}"),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                self.dialog = Some(Dialog::Error {
+                    message: format!("Invalid ticket: {e}"),
+                });
+            }
+        }
     }
 }

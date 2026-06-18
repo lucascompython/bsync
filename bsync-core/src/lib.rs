@@ -126,7 +126,9 @@ pub enum BsyncEffect {
 /// A single entry in the clipboard history.
 #[derive(Debug, Clone)]
 pub struct ClipboardHistoryEntry {
-    /// Truncated preview of the clipboard content.
+    /// Full clipboard content (for re-copy).
+    pub content: String,
+    /// Truncated preview of the clipboard content (for display).
     pub preview: String,
     /// Whether this originated locally (true) or from a remote peer (false).
     pub is_local: bool,
@@ -337,8 +339,6 @@ impl BsyncCore {
         vec![BsyncEffect::Shutdown]
     }
 
-    // ── Helpers ──────────────────────────────────────────────
-
     /// Remove broadcast timestamps older than 1 second.
     fn prune_broadcast_times(&mut self) {
         let now = Instant::now();
@@ -363,9 +363,10 @@ impl BsyncCore {
                     .collect::<String>()
             )
         } else {
-            content
+            content.clone()
         };
         let entry = ClipboardHistoryEntry {
+            content,
             preview,
             is_local,
             origin: origin.to_string(),

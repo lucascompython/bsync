@@ -18,8 +18,6 @@ const STARTUP_WARNING: &str = "\
     Only connect to peers you trust completely.
     Connected peers can see: passwords, 2FA codes, API keys, private text.";
 
-// ── CLI args ──────────────────────────────────────────────────
-
 #[derive(Parser)]
 #[command(name = "bsync", version, about = "P2P clipboard sync")]
 struct Cli {
@@ -44,8 +42,6 @@ struct Cli {
     auto_accept: bool,
 }
 
-// ── Entry point ───────────────────────────────────────────────
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -59,8 +55,6 @@ async fn main() -> anyhow::Result<()> {
     eprintln!("{STARTUP_WARNING}");
     result
 }
-
-// ── TUI mode ──────────────────────────────────────────────────
 
 async fn run_tui(cli: &Cli) -> anyhow::Result<()> {
     use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
@@ -116,21 +110,18 @@ async fn run_tui_loop(
     use app::{App, Dialog};
     use crossterm::event::{Event, KeyEventKind};
 
-    // ── Identity ─────────────────────────────────────────
     let (secret_key, peer_id_str) = identity::load_or_create_key().await?;
 
-    // ── Core + App ──────────────────────────────────────
     let core = BsyncCore::new(Config {
         peer_id: peer_id_str,
         room: room.to_string(),
         auto_accept,
     });
-    let mut app = App::new(core);
+    let mut app = App::new(core, room.to_string());
     app.clipboard_enabled = !no_clipboard;
 
     let _ = app.core.process_event(BsyncEvent::StartEndpoint);
 
-    // ── Gossip setup ────────────────────────────────────
     let mut bootstrap = Vec::new();
     if let Some(ref ticket_str) = connect_ticket {
         match Ticket::decode(ticket_str) {
@@ -161,15 +152,15 @@ async fn run_tui_loop(
 
     let mut gh = gossip::setup(room, &secret_key, bootstrap).await?;
 
-    // ── Clipboard ───────────────────────────────────────
-    let clipboard_ctx: Option<clipboard_rs::ClipboardContext> = if !no_clipboard {
+    app.clipboard_ctx = if !no_clipboard {
         clipboard_rs::ClipboardContext::new().ok()
     } else {
         None
     };
+    app.gossip = Some(gh.gossip.clone());
 
     let (clipboard_tx, mut clipboard_rx) = mpsc::channel::<String>(32);
-    if clipboard_ctx.is_some() {
+    if app.clipboard_ctx.is_some() {
         clipboard::start_watcher(clipboard_tx);
     }
 
@@ -177,7 +168,6 @@ async fn run_tui_loop(
 
     terminal.draw(|frame| ui::draw(frame, &app))?;
 
-    // ── Main TUI event loop ──────────────────────────────
     loop {
         if app.should_quit {
             break;
@@ -187,7 +177,7 @@ async fn run_tui_loop(
             maybe_event = event_stream.next() => {
                 if let Some(Ok(Event::Key(key))) = maybe_event {
                     if key.kind == KeyEventKind::Press {
-                        handle_tui_key(&mut app, key, &gh.sender, &clipboard_ctx).await?;
+                        handle_tui_key(&mut app, key, &gh.sender).await?;
                     }
                 }
             }
@@ -197,14 +187,14 @@ async fn run_tui_loop(
                     BsyncEvent::LocalClipboardChanged { content }
                 );
                 for effect in effects {
-                    dispatch_effect(effect, &gh.sender, &clipboard_ctx).await?;
+                    dispatch_effect(effect, &gh.sender, &app.clipboard_ctx).await?;
                 }
             }
 
             result = gh.receiver.next() => {
                 match result {
                     Some(Ok(event)) => {
-                        handle_gossip_event_tui(event, &mut app, &gh.sender, &clipboard_ctx).await?;
+                        handle_gossip_event_tui(event, &mut app, &gh.sender).await?;
                     }
                     Some(Err(e)) => {
                         app.dialog = Some(Dialog::Error {
@@ -228,20 +218,16 @@ async fn run_tui_loop(
     Ok(())
 }
 
-// ── TUI key handling ──────────────────────────────────────────
-
 async fn handle_tui_key(
     app: &mut app::App,
     key: crossterm::event::KeyEvent,
     sender: &iroh_gossip::api::GossipSender,
-    clipboard_ctx: &Option<clipboard_rs::ClipboardContext>,
 ) -> anyhow::Result<()> {
     use app::Tab;
     use crossterm::event::KeyCode;
 
-    // If a dialog is open, route keys to dialog handler
     if app.dialog.is_some() {
-        return handle_dialog_key(app, key, sender, clipboard_ctx).await;
+        return handle_dialog_key(app, key, sender).await;
     }
 
     match key.code {
@@ -254,7 +240,15 @@ async fn handle_tui_key(
         KeyCode::Char('4') => app.tab = Tab::Help,
         KeyCode::Down | KeyCode::Char('j') => app.scroll_history_down(),
         KeyCode::Up | KeyCode::Char('k') => app.scroll_history_up(),
+
+        // Copy your own ticket to clipboard so you can share it
+        KeyCode::Char('t') => app.copy_ticket_to_clipboard(),
+
         KeyCode::Char('c') => app.open_connect_dialog(),
+
+        // Re-copy a history item to clipboard (Enter on History tab)
+        KeyCode::Enter if app.tab == Tab::History => app.recopy_history_item(),
+
         KeyCode::Char('y') => {
             let view = app.view();
             if let Some(peer_id) = view.pending_peers.first() {
@@ -262,7 +256,7 @@ async fn handle_tui_key(
                     id: peer_id.clone(),
                 });
                 for effect in effects {
-                    dispatch_effect(effect, sender, clipboard_ctx).await?;
+                    dispatch_effect(effect, sender, &app.clipboard_ctx).await?;
                 }
             }
         }
@@ -273,7 +267,7 @@ async fn handle_tui_key(
                     id: peer_id.clone(),
                 });
                 for effect in effects {
-                    dispatch_effect(effect, sender, clipboard_ctx).await?;
+                    dispatch_effect(effect, sender, &app.clipboard_ctx).await?;
                 }
             }
         }
@@ -287,7 +281,6 @@ async fn handle_dialog_key(
     app: &mut app::App,
     key: crossterm::event::KeyEvent,
     sender: &iroh_gossip::api::GossipSender,
-    clipboard_ctx: &Option<clipboard_rs::ClipboardContext>,
 ) -> anyhow::Result<()> {
     use app::Dialog;
     use crossterm::event::{KeyCode, KeyModifiers};
@@ -301,7 +294,7 @@ async fn handle_dialog_key(
                     .core
                     .process_event(BsyncEvent::PeerApproved { id: peer_id });
                 for effect in effects {
-                    dispatch_effect(effect, sender, clipboard_ctx).await?;
+                    dispatch_effect(effect, sender, &app.clipboard_ctx).await?;
                 }
             }
             KeyCode::Char('n') => {
@@ -309,7 +302,7 @@ async fn handle_dialog_key(
                     .core
                     .process_event(BsyncEvent::PeerRejected { id: peer_id });
                 for effect in effects {
-                    dispatch_effect(effect, sender, clipboard_ctx).await?;
+                    dispatch_effect(effect, sender, &app.clipboard_ctx).await?;
                 }
             }
             KeyCode::Esc => {}
@@ -323,41 +316,7 @@ async fn handle_dialog_key(
                         message: "Ticket cannot be empty".into(),
                     });
                 } else {
-                    match Ticket::decode(&input) {
-                        Ok(ticket) => {
-                            let effects = app
-                                .core
-                                .process_event(BsyncEvent::ConnectToPeer { ticket: input });
-                            for effect in effects {
-                                if let BsyncEffect::ConnectToEndpoint { endpoint_addr } = &effect {
-                                    match gossip::parse_endpoint_addr(endpoint_addr) {
-                                        Ok(_id) => {
-                                            app.dialog = Some(Dialog::Info {
-                                                message: format!(
-                                                    "Connecting to {} in room {}...",
-                                                    &ticket.endpoint_addr
-                                                        [..ticket.endpoint_addr.len().min(20)],
-                                                    ticket.room
-                                                ),
-                                            });
-                                        }
-                                        Err(e) => {
-                                            app.dialog = Some(Dialog::Error {
-                                                message: format!("Invalid endpoint: {e}"),
-                                            });
-                                        }
-                                    }
-                                } else {
-                                    dispatch_effect(effect, sender, clipboard_ctx).await?;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            app.dialog = Some(Dialog::Error {
-                                message: format!("Invalid ticket: {e}"),
-                            });
-                        }
-                    }
+                    app.connect_to_peer(input).await;
                 }
             }
             KeyCode::Esc => {}
@@ -366,7 +325,7 @@ async fn handle_dialog_key(
                 app.dialog = Some(Dialog::ConnectInput { input });
             }
             KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(ctx) = clipboard_ctx {
+                if let Some(ctx) = &app.clipboard_ctx {
                     if let Ok(text) = ctx.get_text() {
                         input.push_str(&text);
                     }
@@ -390,13 +349,10 @@ async fn handle_dialog_key(
     Ok(())
 }
 
-// ── Gossip event handling (TUI) ───────────────────────────────
-
 async fn handle_gossip_event_tui(
     event: GossipEvent,
     app: &mut app::App,
     sender: &iroh_gossip::api::GossipSender,
-    clipboard_ctx: &Option<clipboard_rs::ClipboardContext>,
 ) -> anyhow::Result<()> {
     use app::Dialog;
 
@@ -410,7 +366,7 @@ async fn handle_gossip_event_tui(
                     content,
                 });
                 for effect in effects {
-                    dispatch_effect(effect, sender, clipboard_ctx).await?;
+                    dispatch_effect(effect, sender, &app.clipboard_ctx).await?;
                 }
             }
         }
@@ -424,7 +380,7 @@ async fn handle_gossip_event_tui(
                         peer_id: peer_id.clone(),
                     });
                 }
-                dispatch_effect(effect, sender, clipboard_ctx).await?;
+                dispatch_effect(effect, sender, &app.clipboard_ctx).await?;
             }
         }
         GossipEvent::NeighborDown(id) => {
@@ -432,7 +388,7 @@ async fn handle_gossip_event_tui(
                 .core
                 .process_event(BsyncEvent::PeerDisconnected { id: id.to_string() });
             for effect in effects {
-                dispatch_effect(effect, sender, clipboard_ctx).await?;
+                dispatch_effect(effect, sender, &app.clipboard_ctx).await?;
             }
         }
         GossipEvent::Lagged => {
@@ -444,8 +400,6 @@ async fn handle_gossip_event_tui(
     }
     Ok(())
 }
-
-// ── Shared effect dispatch ────────────────────────────────────
 
 async fn dispatch_effect(
     effect: BsyncEffect,

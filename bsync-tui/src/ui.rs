@@ -14,10 +14,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     let title = Line::from(" bsync ".bold());
     let instructions = Line::from(vec![
-        Span::raw(" Tab:switch "),
+        Span::raw(" Tabs "),
         Span::styled("<Tab>", Style::new().fg(Color::Blue).bold()),
         Span::raw(" Scroll "),
         Span::styled("<\u{2191}\u{2193}>", Style::new().fg(Color::Blue).bold()),
+        Span::raw(" Ticket "),
+        Span::styled("<t>", Style::new().fg(Color::Blue).bold()),
         Span::raw(" Connect "),
         Span::styled("<c>", Style::new().fg(Color::Blue).bold()),
         Span::raw(" Quit "),
@@ -68,6 +70,13 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(vec![
             Span::styled("Ticket:  ", Style::new().bold()),
             Span::raw(&view.ticket),
+        ]),
+        Line::from(vec![
+            Span::styled("         ", Style::new().bold()),
+            Span::styled(
+                "press <t> to copy to clipboard",
+                Style::new().fg(Color::DarkGray),
+            ),
         ]),
         Line::from(""),
         Line::from(vec![
@@ -207,7 +216,7 @@ fn draw_history(frame: &mut Frame, app: &App, area: Rect) {
     ));
 
     let list = List::new(items)
-        .block(Block::bordered().title(format!(" Clipboard History ({}) ", view.history.len())))
+        .block(Block::bordered().title(format!(" Clipboard History ({}) — Enter to re-copy ", view.history.len())))
         .highlight_style(
             Style::new()
                 .bg(Color::DarkGray)
@@ -241,6 +250,14 @@ fn draw_help(frame: &mut Frame, area: Rect) {
                 Style::new().bold().fg(Color::Cyan),
             ),
             Span::raw("Scroll history list"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Enter     ", Style::new().bold().fg(Color::Cyan)),
+            Span::raw("Re-copy selected history item to clipboard"),
+        ]),
+        Line::from(vec![
+            Span::styled("  t         ", Style::new().bold().fg(Color::Cyan)),
+            Span::raw("Copy your ticket to clipboard (share it with peers)"),
         ]),
         Line::from(vec![
             Span::styled("  c         ", Style::new().bold().fg(Color::Cyan)),
