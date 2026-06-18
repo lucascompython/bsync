@@ -1,7 +1,9 @@
 // Clipboard watcher using clipboard-rs.
 // Runs in a separate thread, sending changes through a tokio channel.
 
-use clipboard_rs::{Clipboard, ClipboardContext, ClipboardHandler, ClipboardWatcher, ClipboardWatcherContext};
+use clipboard_rs::{
+    Clipboard, ClipboardContext, ClipboardHandler, ClipboardWatcher, ClipboardWatcherContext,
+};
 
 /// Start the clipboard watcher in a background thread.
 /// Sends detected text changes through `tx`. Returns immediately.
@@ -43,6 +45,7 @@ struct WatcherHandler {
 impl ClipboardHandler for WatcherHandler {
     fn on_clipboard_change(&mut self) {
         if let Ok(text) = self.ctx.get_text() {
+            println!("(local) Clipboard changed: {text}");
             let _ = self.tx.blocking_send(text);
         }
     }

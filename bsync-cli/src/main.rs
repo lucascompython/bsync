@@ -79,8 +79,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     if let Some(ticket_str) = &cli.connect {
         match Ticket::decode(ticket_str) {
             Ok(_ticket) => {
-                let effects = core
-                    .process_event(BsyncEvent::ConnectToPeer { ticket: ticket_str.clone() });
+                let effects = core.process_event(BsyncEvent::ConnectToPeer {
+                    ticket: ticket_str.clone(),
+                });
                 for effect in effects {
                     match effect {
                         BsyncEffect::ConnectToEndpoint { endpoint_addr } => {
@@ -122,8 +123,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     }
 
     // ── Approval channel ─────────────────────────────────
-    let (approval_tx, mut approval_rx) =
-        tokio::sync::mpsc::unbounded_channel::<(String, bool)>();
+    let (approval_tx, mut approval_rx) = tokio::sync::mpsc::unbounded_channel::<(String, bool)>();
 
     println!("Waiting for connections...");
 
@@ -197,40 +197,34 @@ async fn handle_gossip_event(
     approval_tx: &tokio::sync::mpsc::UnboundedSender<(String, bool)>,
 ) -> anyhow::Result<()> {
     match event {
-        Event::Received(msg) => {
-            match serde_json::from_slice::<GossipMessage>(&msg.content) {
-                Ok(GossipMessage::ClipboardText { origin, content }) => {
-                    let effects = core.process_event(BsyncEvent::RemoteMessageReceived {
-                        from: origin,
-                        content,
-                    });
-                    for effect in effects {
-                        dispatch_effect(effect, sender, clipboard_ctx, approval_tx).await?;
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Failed to deserialize gossip message: {e}");
+        Event::Received(msg) => match serde_json::from_slice::<GossipMessage>(&msg.content) {
+            Ok(GossipMessage::ClipboardText { origin, content }) => {
+                let effects = core.process_event(BsyncEvent::RemoteMessageReceived {
+                    from: origin,
+                    content,
+                });
+                for effect in effects {
+                    dispatch_effect(effect, sender, clipboard_ctx, approval_tx).await?;
                 }
             }
-        }
+            Err(e) => {
+                eprintln!("Failed to deserialize gossip message: {e}");
+            }
+        },
         Event::NeighborUp(id) => {
-            let effects =
-                core.process_event(BsyncEvent::PeerConnected { id: id.to_string() });
+            let effects = core.process_event(BsyncEvent::PeerConnected { id: id.to_string() });
             for effect in effects {
                 dispatch_effect(effect, sender, clipboard_ctx, approval_tx).await?;
             }
         }
         Event::NeighborDown(id) => {
-            let effects =
-                core.process_event(BsyncEvent::PeerDisconnected { id: id.to_string() });
+            let effects = core.process_event(BsyncEvent::PeerDisconnected { id: id.to_string() });
             for effect in effects {
                 dispatch_effect(effect, sender, clipboard_ctx, approval_tx).await?;
             }
         }
         Event::Lagged => {
-            eprintln!(
-                "Warning: gossip stream lagged — some clipboard updates were dropped"
-            );
+            eprintln!("Warning: gossip stream lagged — some clipboard updates were dropped");
         }
     }
     Ok(())
@@ -247,6 +241,7 @@ async fn dispatch_effect(
     match effect {
         BsyncEffect::WriteClipboard { content, .. } => {
             if let Some(ctx) = clipboard_ctx {
+                println!("(remote) Writing to clipboard: {content}");
                 ctx.set_text(content).ok();
             }
         }
@@ -272,9 +267,7 @@ async fn dispatch_effect(
             tokio::task::spawn_blocking(move || {
                 println!("Peer {peer_id} wants to connect. Allow? [y/N]: ");
                 let mut input = String::new();
-                let approved = std::io::stdin()
-                    .read_line(&mut input)
-                    .is_ok()
+                let approved = std::io::stdin().read_line(&mut input).is_ok()
                     && input.trim().eq_ignore_ascii_case("y");
                 let _ = tx.send((peer_id, approved));
             });
