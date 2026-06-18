@@ -80,61 +80,81 @@ pub enum TicketError {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum GossipMessage {
     ClipboardText { origin: String, content: String },
+    ClipboardImage { origin: String, png_data: Vec<u8> },
+}
+
+/// Content that can be synced: text or PNG-encoded image.
+#[derive(Debug, Clone)]
+pub enum ClipboardContent {
+    Text(String),
+    Image(Vec<u8>),
+}
+
+impl ClipboardContent {
+    pub fn hash_bytes(&self) -> Vec<u8> {
+        match self {
+            ClipboardContent::Text(s) => s.as_bytes().to_vec(),
+            ClipboardContent::Image(d) => d.clone(),
+        }
+    }
+
+    pub fn preview(&self) -> String {
+        match self {
+            ClipboardContent::Text(s) => {
+                if s.chars().count() > HISTORY_PREVIEW_LEN {
+                    format!(
+                        "{}\u{2026}",
+                        s.chars().take(HISTORY_PREVIEW_LEN).collect::<String>()
+                    )
+                } else {
+                    s.clone()
+                }
+            }
+            ClipboardContent::Image(d) => {
+                format!("\u{1f5bc} Image ({} bytes)", d.len())
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub enum BsyncEvent {
-    /// Start the endpoint — core produces ticket + status.
     StartEndpoint,
-    /// User wants to connect to a peer via ticket.
     ConnectToPeer { ticket: String },
-    /// Local clipboard content changed (from watcher).
-    LocalClipboardChanged { content: String },
-    /// Remote peer sent clipboard content.
-    RemoteMessageReceived { from: String, content: String },
-    /// New peer connected (NeighborUp).
+    LocalClipboardChanged { content: ClipboardContent },
+    RemoteMessageReceived { from: String, content: ClipboardContent },
     PeerConnected { id: String },
-    /// Peer disconnected (NeighborDown).
     PeerDisconnected { id: String },
-    /// User approved a pending peer.
     PeerApproved { id: String },
-    /// User rejected a pending peer.
     PeerRejected { id: String },
-    /// Graceful shutdown requested (Ctrl+C).
     Shutdown,
 }
 
 #[derive(Debug)]
 pub enum BsyncEffect {
-    /// Shell writes content to local clipboard. `write_hash` is for echo guard.
     WriteClipboard {
-        content: String,
+        content: ClipboardContent,
         write_hash: [u8; 32],
     },
-    /// Shell serializes message to JSON bytes and broadcasts via gossip.
     BroadcastMessage { message: GossipMessage },
-    /// Shell prints a status line to the user.
     PrintStatus { message: String },
-    /// Shell prompts the user to approve/reject a pending peer.
     PromptApproval { peer_id: String },
-    /// Shell resolves the endpoint address and bootstraps a connection.
     ConnectToEndpoint { endpoint_addr: String },
-    /// Shutdown signal — shell performs cleanup.
     Shutdown,
 }
 
 /// A single entry in the clipboard history.
 #[derive(Debug, Clone)]
 pub struct ClipboardHistoryEntry {
-    /// Full clipboard content (for re-copy).
-    pub content: String,
-    /// Truncated preview of the clipboard content (for display).
+    /// Full content (for re-copy).
+    pub content: ClipboardContent,
+    /// Truncated preview (for display).
     pub preview: String,
     /// Whether this originated locally (true) or from a remote peer (false).
     pub is_local: bool,
-    /// Peer ID of the origin (equals our peer_id for local copies).
+    /// Peer ID of the origin.
     pub origin: String,
-    /// When this entry was recorded (system time, for display).
+    /// When this entry was recorded.
     pub timestamp: SystemTime,
 }
 
@@ -234,20 +254,17 @@ impl BsyncCore {
         }
     }
 
-    fn handle_local_change(&mut self, content: String) -> Vec<BsyncEffect> {
-        let hash = blake3::hash(content.as_bytes());
+    fn handle_local_change(&mut self, content: ClipboardContent) -> Vec<BsyncEffect> {
+        let hash = blake3::hash(&content.hash_bytes());
 
-        // Echo guard: if this matches our pending write, suppress broadcast.
         if self.pending_write_hash == Some(hash) {
             self.pending_write_hash = None;
             return vec![];
         }
 
-        // Record in history regardless of rate limiting.
         let origin = self.peer_id.clone();
         self.push_history(content.clone(), &origin, true);
 
-        // Rate limit: at most MAX_BROADCASTS_PER_SEC broadcasts per second.
         self.prune_broadcast_times();
         if self.broadcast_times.len() >= MAX_BROADCASTS_PER_SEC {
             return vec![];
@@ -256,30 +273,33 @@ impl BsyncCore {
         self.broadcast_times.push_back(Instant::now());
         self.status = "syncing...".into();
 
-        vec![BsyncEffect::BroadcastMessage {
-            message: GossipMessage::ClipboardText {
+        let message = match &content {
+            ClipboardContent::Text(text) => GossipMessage::ClipboardText {
                 origin: self.peer_id.clone(),
-                content,
+                content: text.clone(),
             },
-        }]
+            ClipboardContent::Image(png_data) => GossipMessage::ClipboardImage {
+                origin: self.peer_id.clone(),
+                png_data: png_data.clone(),
+            },
+        };
+
+        vec![BsyncEffect::BroadcastMessage { message }]
     }
 
-    fn handle_remote_message(&mut self, from: String, content: String) -> Vec<BsyncEffect> {
-        // Approval gate: only process messages from approved peers.
-        // Pending, rejected, or unknown peers are silently dropped.
+    fn handle_remote_message(&mut self, from: String, content: ClipboardContent) -> Vec<BsyncEffect> {
         if !self.connected_peers.contains(&from) {
             return vec![];
         }
 
-        let hash = blake3::hash(content.as_bytes());
+        let hash = blake3::hash(&content.hash_bytes());
 
-        // Dedup: skip if we already applied this exact content.
         if self.last_applied_hash == Some(hash) {
             return vec![];
         }
 
         self.last_applied_hash = Some(hash);
-        self.pending_write_hash = Some(hash); // Set echo guard
+        self.pending_write_hash = Some(hash);
         self.push_history(content.clone(), &from, false);
 
         vec![BsyncEffect::WriteClipboard {
@@ -352,19 +372,8 @@ impl BsyncCore {
         }
     }
 
-    /// Push a clipboard entry to history, evicting oldest if at capacity.
-    fn push_history(&mut self, content: String, origin: &str, is_local: bool) {
-        let preview: String = if content.chars().count() > HISTORY_PREVIEW_LEN {
-            format!(
-                "{}\u{2026}",
-                content
-                    .chars()
-                    .take(HISTORY_PREVIEW_LEN)
-                    .collect::<String>()
-            )
-        } else {
-            content.clone()
-        };
+    fn push_history(&mut self, content: ClipboardContent, origin: &str, is_local: bool) {
+        let preview = content.preview();
         let entry = ClipboardHistoryEntry {
             content,
             preview,
@@ -445,13 +454,13 @@ mod tests {
         // Simulate remote message → WriteClipboard sets pending_write_hash
         let effects = core.process_event(BsyncEvent::RemoteMessageReceived {
             from: "peer-2".into(),
-            content: "hello".into(),
+            content: ClipboardContent::Text("hello".into()),
         });
         assert_eq!(effects.len(), 1); // One WriteClipboard
 
         // Local change with same content → should be suppressed
         let effects = core.process_event(BsyncEvent::LocalClipboardChanged {
-            content: "hello".into(),
+            content: ClipboardContent::Text("hello".into()),
         });
         assert!(effects.is_empty(), "echo guard should suppress own write");
     }
@@ -464,17 +473,17 @@ mod tests {
         // Write from remote → pending_write_hash set
         core.process_event(BsyncEvent::RemoteMessageReceived {
             from: "peer-2".into(),
-            content: "hello".into(),
+            content: ClipboardContent::Text("hello".into()),
         });
 
         // Echo guard clears on first local detection
         core.process_event(BsyncEvent::LocalClipboardChanged {
-            content: "hello".into(),
+            content: ClipboardContent::Text("hello".into()),
         });
 
         // Different content → should broadcast normally
         let effects = core.process_event(BsyncEvent::LocalClipboardChanged {
-            content: "world".into(),
+            content: ClipboardContent::Text("world".into()),
         });
         assert_eq!(effects.len(), 1);
         match &effects[0] {
@@ -495,13 +504,13 @@ mod tests {
 
         let effects1 = core.process_event(BsyncEvent::RemoteMessageReceived {
             from: "peer-2".into(),
-            content: "dup".into(),
+            content: ClipboardContent::Text("dup".into()),
         });
         assert_eq!(effects1.len(), 1);
 
         let effects2 = core.process_event(BsyncEvent::RemoteMessageReceived {
             from: "peer-2".into(),
-            content: "dup".into(),
+            content: ClipboardContent::Text("dup".into()),
         });
         assert!(effects2.is_empty(), "dedup should skip identical content");
     }
@@ -562,7 +571,7 @@ mod tests {
         // Message from pending peer → should be dropped
         let effects = core.process_event(BsyncEvent::RemoteMessageReceived {
             from: "p2".into(),
-            content: "secret".into(),
+            content: ClipboardContent::Text("secret".into()),
         });
         assert!(
             effects.is_empty(),
@@ -575,7 +584,7 @@ mod tests {
         // Message from rejected peer → still dropped
         let effects = core.process_event(BsyncEvent::RemoteMessageReceived {
             from: "p2".into(),
-            content: "secret".into(),
+            content: ClipboardContent::Text("secret".into()),
         });
         assert!(
             effects.is_empty(),
@@ -590,13 +599,13 @@ mod tests {
 
         // Local copy
         core.process_event(BsyncEvent::LocalClipboardChanged {
-            content: "local text".into(),
+            content: ClipboardContent::Text("local text".into()),
         });
 
         // Remote receive
         core.process_event(BsyncEvent::RemoteMessageReceived {
             from: "peer-2".into(),
-            content: "remote text".into(),
+            content: ClipboardContent::Text("remote text".into()),
         });
 
         let view = core.view();
@@ -616,7 +625,9 @@ mod tests {
     fn history_truncates_long_content() {
         let mut core = test_core();
         let long = "x".repeat(200);
-        core.process_event(BsyncEvent::LocalClipboardChanged { content: long });
+        core.process_event(BsyncEvent::LocalClipboardChanged {
+            content: ClipboardContent::Text(long),
+        });
 
         let view = core.view();
         assert_eq!(view.history.len(), 1);
@@ -629,7 +640,7 @@ mod tests {
         let mut core = test_core();
         for i in 0..60 {
             core.process_event(BsyncEvent::LocalClipboardChanged {
-                content: format!("item {i}"),
+                content: ClipboardContent::Text(format!("item {i}")),
             });
         }
         let view = core.view();
@@ -642,5 +653,51 @@ mod tests {
         let view = core.view();
         assert_eq!(view.room, "test-room");
         assert!(!view.ticket.is_empty());
+    }
+
+    #[test]
+    fn image_echo_guard_suppresses_own_write() {
+        let mut core = test_core();
+        connect_peer(&mut core, "peer-2");
+
+        let png = vec![0x89, 0x50, 0x4e, 0x47]; // fake PNG header
+
+        let effects = core.process_event(BsyncEvent::RemoteMessageReceived {
+            from: "peer-2".into(),
+            content: ClipboardContent::Image(png.clone()),
+        });
+        assert_eq!(effects.len(), 1);
+
+        let effects = core.process_event(BsyncEvent::LocalClipboardChanged {
+            content: ClipboardContent::Image(png),
+        });
+        assert!(effects.is_empty(), "echo guard should suppress image echo");
+    }
+
+    #[test]
+    fn image_dedup_skips_identical_content() {
+        let mut core = test_core();
+        connect_peer(&mut core, "peer-2");
+
+        let png = vec![1, 2, 3, 4];
+
+        let effects1 = core.process_event(BsyncEvent::RemoteMessageReceived {
+            from: "peer-2".into(),
+            content: ClipboardContent::Image(png.clone()),
+        });
+        assert_eq!(effects1.len(), 1);
+
+        let effects2 = core.process_event(BsyncEvent::RemoteMessageReceived {
+            from: "peer-2".into(),
+            content: ClipboardContent::Image(png),
+        });
+        assert!(effects2.is_empty(), "dedup should skip identical image");
+    }
+
+    #[test]
+    fn image_preview_shows_byte_count() {
+        let content = ClipboardContent::Image(vec![1, 2, 3, 4, 5]);
+        assert!(content.preview().contains("Image"));
+        assert!(content.preview().contains("5 bytes"));
     }
 }

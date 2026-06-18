@@ -1,4 +1,4 @@
-use bsync_core::{BsyncCore, BsyncViewModel, BsyncEffect, BsyncEvent, Ticket};
+use bsync_core::{BsyncCore, BsyncEffect, BsyncEvent, BsyncViewModel, Ticket};
 use clipboard_rs::Clipboard;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,13 +115,16 @@ impl App {
             return;
         }
         let idx = self.history_scroll.min(view.history.len() - 1);
-        if let Some(entry) = view.history.get(idx) {
-            if let Some(ctx) = &self.clipboard_ctx {
-                let _ = ctx.set_text(entry.content.clone());
-                self.dialog = Some(Dialog::Info {
-                    message: format!("Copied to clipboard: {}", &entry.preview[..entry.preview.len().min(40)]),
-                });
-            }
+        if let Some(entry) = view.history.get(idx)
+            && let Some(ctx) = &self.clipboard_ctx
+        {
+            let _ = bsync_rust::clipboard::write_clipboard(ctx, &entry.content);
+            self.dialog = Some(Dialog::Info {
+                message: format!(
+                    "Copied to clipboard: {}",
+                    &entry.preview[..entry.preview.len().min(40)]
+                ),
+            });
         }
     }
 

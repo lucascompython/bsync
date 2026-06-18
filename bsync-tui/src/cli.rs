@@ -3,7 +3,6 @@ use bsync_core::{
     BsyncCore, BsyncEffect, BsyncEvent, Config, GossipMessage, Ticket, MAX_MESSAGE_SIZE,
 };
 use bsync_rust::{clipboard, gossip, identity};
-use clipboard_rs::Clipboard;
 use futures_lite::StreamExt;
 use iroh_gossip::api::Event;
 use tokio::sync::mpsc;
@@ -64,7 +63,7 @@ pub async fn run(cli: &CliArgs) -> anyhow::Result<()> {
         None
     };
 
-    let (clipboard_tx, mut clipboard_rx) = mpsc::channel::<String>(32);
+    let (clipboard_tx, mut clipboard_rx) = mpsc::channel::<bsync_core::ClipboardContent>(32);
     if clipboard_ctx.is_some() {
         clipboard::start_watcher(clipboard_tx);
     }
@@ -133,7 +132,15 @@ async fn handle_gossip_event(
 ) -> anyhow::Result<()> {
     match event {
         Event::Received(msg) => match serde_json::from_slice::<GossipMessage>(&msg.content) {
-            Ok(GossipMessage::ClipboardText { origin, content }) => {
+            Ok(gm) => {
+                let (origin, content) = match gm {
+                    GossipMessage::ClipboardText { origin, content } => {
+                        (origin, bsync_core::ClipboardContent::Text(content))
+                    }
+                    GossipMessage::ClipboardImage { origin, png_data } => {
+                        (origin, bsync_core::ClipboardContent::Image(png_data))
+                    }
+                };
                 let effects = core.process_event(BsyncEvent::RemoteMessageReceived {
                     from: origin,
                     content,
@@ -174,7 +181,7 @@ async fn dispatch_effect(
     match effect {
         BsyncEffect::WriteClipboard { content, .. } => {
             if let Some(ctx) = clipboard_ctx {
-                ctx.set_text(content).ok();
+                let _ = bsync_rust::clipboard::write_clipboard(ctx, &content);
             }
         }
 

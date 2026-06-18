@@ -4,7 +4,7 @@ mod ui;
 
 use anyhow::Context;
 use bsync_core::{
-    BsyncCore, BsyncEffect, BsyncEvent, Config, GossipMessage, Ticket, MAX_MESSAGE_SIZE,
+    BsyncCore, BsyncEffect, BsyncEvent, Config, GossipMessage, MAX_MESSAGE_SIZE, Ticket,
 };
 use bsync_rust::{clipboard, gossip, identity};
 use clap::Parser;
@@ -60,9 +60,9 @@ async fn run_tui(cli: &Cli) -> anyhow::Result<()> {
     use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
     use crossterm::execute;
     use crossterm::terminal::{
-        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
     };
-    use ratatui::{backend::CrosstermBackend, Terminal};
+    use ratatui::{Terminal, backend::CrosstermBackend};
     use std::io::stdout;
 
     enable_raw_mode().context("enable raw mode")?;
@@ -159,7 +159,7 @@ async fn run_tui_loop(
     };
     app.gossip = Some(gh.gossip.clone());
 
-    let (clipboard_tx, mut clipboard_rx) = mpsc::channel::<String>(32);
+    let (clipboard_tx, mut clipboard_rx) = mpsc::channel::<bsync_core::ClipboardContent>(32);
     if app.clipboard_ctx.is_some() {
         clipboard::start_watcher(clipboard_tx);
     }
@@ -175,11 +175,11 @@ async fn run_tui_loop(
 
         tokio::select! {
             maybe_event = event_stream.next() => {
-                if let Some(Ok(Event::Key(key))) = maybe_event {
-                    if key.kind == KeyEventKind::Press {
+                if let Some(Ok(Event::Key(key))) = maybe_event
+                    && key.kind == KeyEventKind::Press {
                         handle_tui_key(&mut app, key, &gh.sender).await?;
                     }
-                }
+
             }
 
             Some(content) = clipboard_rx.recv() => {
@@ -325,10 +325,10 @@ async fn handle_dialog_key(
                 app.dialog = Some(Dialog::ConnectInput { input });
             }
             KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(ctx) = &app.clipboard_ctx {
-                    if let Ok(text) = ctx.get_text() {
-                        input.push_str(&text);
-                    }
+                if let Some(ctx) = &app.clipboard_ctx
+                    && let Ok(text) = ctx.get_text()
+                {
+                    input.push_str(&text);
                 }
                 app.dialog = Some(Dialog::ConnectInput { input });
             }
@@ -358,9 +358,15 @@ async fn handle_gossip_event_tui(
 
     match event {
         GossipEvent::Received(msg) => {
-            if let Ok(GossipMessage::ClipboardText { origin, content }) =
-                serde_json::from_slice::<GossipMessage>(&msg.content)
-            {
+            if let Ok(gm) = serde_json::from_slice::<GossipMessage>(&msg.content) {
+                let (origin, content) = match gm {
+                    GossipMessage::ClipboardText { origin, content } => {
+                        (origin, bsync_core::ClipboardContent::Text(content))
+                    }
+                    GossipMessage::ClipboardImage { origin, png_data } => {
+                        (origin, bsync_core::ClipboardContent::Image(png_data))
+                    }
+                };
                 let effects = app.core.process_event(BsyncEvent::RemoteMessageReceived {
                     from: origin,
                     content,
@@ -409,7 +415,7 @@ async fn dispatch_effect(
     match effect {
         BsyncEffect::WriteClipboard { content, .. } => {
             if let Some(ctx) = clipboard_ctx {
-                let _ = ctx.set_text(content);
+                let _ = bsync_rust::clipboard::write_clipboard(ctx, &content);
             }
         }
         BsyncEffect::BroadcastMessage { message } => {
