@@ -1,7 +1,7 @@
 [package]
 name = "bsync-core"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "Pure logic core for bsync — P2P clipboard sync (zero I/O deps)"
 
 [dependencies]

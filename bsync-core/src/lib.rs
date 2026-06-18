@@ -58,8 +58,7 @@ impl Ticket {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(encoded)
             .map_err(|_| TicketError::InvalidEncoding)?;
-        let ticket: Self =
-            serde_json::from_slice(&bytes).map_err(|_| TicketError::InvalidJson)?;
+        let ticket: Self = serde_json::from_slice(&bytes).map_err(|_| TicketError::InvalidJson)?;
         if ticket.v != 1 {
             return Err(TicketError::UnsupportedVersion(ticket.v));
         }
@@ -209,10 +208,7 @@ impl BsyncCore {
         let ticket = Ticket::new(self.peer_id.clone(), self.room.clone()).encode();
         self.status = "waiting for connections...".into();
         vec![BsyncEffect::PrintStatus {
-            message: format!(
-                "Peer ID: {}\nTicket:  {}\nRoom:    {}\n",
-                self.peer_id, ticket, self.room
-            ),
+            message: format!("Ticket:  {}\nRoom:    {}\n", ticket, self.room),
         }]
     }
 
@@ -256,7 +252,13 @@ impl BsyncCore {
         }]
     }
 
-    fn handle_remote_message(&mut self, _from: String, content: String) -> Vec<BsyncEffect> {
+    fn handle_remote_message(&mut self, from: String, content: String) -> Vec<BsyncEffect> {
+        // Approval gate: only process messages from approved peers.
+        // Pending, rejected, or unknown peers are silently dropped.
+        if !self.connected_peers.contains(&from) {
+            return vec![];
+        }
+
         let hash = blake3::hash(content.as_bytes());
 
         // Dedup: skip if we already applied this exact content.
@@ -333,7 +335,7 @@ impl BsyncCore {
         while self
             .broadcast_times
             .front()
-            .map_or(false, |t| now.duration_since(*t) >= one_sec)
+            .is_some_and(|t| now.duration_since(*t) >= one_sec)
         {
             self.broadcast_times.pop_front();
         }
@@ -354,6 +356,12 @@ mod tests {
         })
     }
 
+    /// Helper: connect + approve a peer so its messages pass the approval gate.
+    fn connect_peer(core: &mut BsyncCore, id: &str) {
+        core.process_event(BsyncEvent::PeerConnected { id: id.into() });
+        core.process_event(BsyncEvent::PeerApproved { id: id.into() });
+    }
+
     #[test]
     fn start_produces_ticket() {
         let mut core = test_core();
@@ -361,7 +369,6 @@ mod tests {
         assert_eq!(effects.len(), 1);
         match &effects[0] {
             BsyncEffect::PrintStatus { message } => {
-                assert!(message.contains("Peer ID:"));
                 assert!(message.contains("Ticket:"));
                 assert!(message.contains("Room:"));
             }
@@ -395,23 +402,27 @@ mod tests {
     fn echo_guard_suppresses_own_write() {
         let mut core = test_core();
 
+        // Connect peer first (approval gate requires it)
+        connect_peer(&mut core, "peer-2");
+
         // Simulate remote message → WriteClipboard sets pending_write_hash
-        let effects =
-            core.process_event(BsyncEvent::RemoteMessageReceived {
-                from: "peer-2".into(),
-                content: "hello".into(),
-            });
+        let effects = core.process_event(BsyncEvent::RemoteMessageReceived {
+            from: "peer-2".into(),
+            content: "hello".into(),
+        });
         assert_eq!(effects.len(), 1); // One WriteClipboard
 
         // Local change with same content → should be suppressed
-        let effects =
-            core.process_event(BsyncEvent::LocalClipboardChanged { content: "hello".into() });
+        let effects = core.process_event(BsyncEvent::LocalClipboardChanged {
+            content: "hello".into(),
+        });
         assert!(effects.is_empty(), "echo guard should suppress own write");
     }
 
     #[test]
     fn local_change_after_echo_guard_clear_broadcasts() {
         let mut core = test_core();
+        connect_peer(&mut core, "peer-2");
 
         // Write from remote → pending_write_hash set
         core.process_event(BsyncEvent::RemoteMessageReceived {
@@ -420,11 +431,14 @@ mod tests {
         });
 
         // Echo guard clears on first local detection
-        core.process_event(BsyncEvent::LocalClipboardChanged { content: "hello".into() });
+        core.process_event(BsyncEvent::LocalClipboardChanged {
+            content: "hello".into(),
+        });
 
         // Different content → should broadcast normally
-        let effects =
-            core.process_event(BsyncEvent::LocalClipboardChanged { content: "world".into() });
+        let effects = core.process_event(BsyncEvent::LocalClipboardChanged {
+            content: "world".into(),
+        });
         assert_eq!(effects.len(), 1);
         match &effects[0] {
             BsyncEffect::BroadcastMessage {
@@ -440,6 +454,7 @@ mod tests {
     #[test]
     fn remote_dedup_skips_identical_content() {
         let mut core = test_core();
+        connect_peer(&mut core, "peer-2");
 
         let effects1 = core.process_event(BsyncEvent::RemoteMessageReceived {
             from: "peer-2".into(),
@@ -448,7 +463,7 @@ mod tests {
         assert_eq!(effects1.len(), 1);
 
         let effects2 = core.process_event(BsyncEvent::RemoteMessageReceived {
-            from: "peer-3".into(),
+            from: "peer-2".into(),
             content: "dup".into(),
         });
         assert!(effects2.is_empty(), "dedup should skip identical content");
@@ -498,5 +513,36 @@ mod tests {
 
         let view = core.view();
         assert!(view.connected_peers.contains(&"p2".to_string()));
+    }
+
+    #[test]
+    fn unapproved_peer_messages_are_dropped() {
+        let mut core = test_core();
+
+        // Peer connects but is NOT approved
+        core.process_event(BsyncEvent::PeerConnected { id: "p2".into() });
+
+        // Message from pending peer → should be dropped
+        let effects = core.process_event(BsyncEvent::RemoteMessageReceived {
+            from: "p2".into(),
+            content: "secret".into(),
+        });
+        assert!(
+            effects.is_empty(),
+            "messages from unapproved peers must be dropped"
+        );
+
+        // Reject the peer
+        core.process_event(BsyncEvent::PeerRejected { id: "p2".into() });
+
+        // Message from rejected peer → still dropped
+        let effects = core.process_event(BsyncEvent::RemoteMessageReceived {
+            from: "p2".into(),
+            content: "secret".into(),
+        });
+        assert!(
+            effects.is_empty(),
+            "messages from rejected peers must be dropped"
+        );
     }
 }
