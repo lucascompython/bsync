@@ -80,7 +80,7 @@ pub enum TicketError {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum GossipMessage {
     ClipboardText { origin: String, content: String },
-    ClipboardImage { origin: String, png_data: Vec<u8> },
+    ClipboardImage { origin: String, hash: [u8; 32] },
 }
 
 /// Content that can be synced: text or PNG-encoded image.
@@ -137,6 +137,7 @@ pub enum BsyncEffect {
         write_hash: [u8; 32],
     },
     BroadcastMessage { message: GossipMessage },
+    BroadcastImage { origin: String, png_data: Vec<u8> },
     PrintStatus { message: String },
     PromptApproval { peer_id: String },
     ConnectToEndpoint { endpoint_addr: String },
@@ -278,10 +279,12 @@ impl BsyncCore {
                 origin: self.peer_id.clone(),
                 content: text.clone(),
             },
-            ClipboardContent::Image(png_data) => GossipMessage::ClipboardImage {
-                origin: self.peer_id.clone(),
-                png_data: png_data.clone(),
-            },
+            ClipboardContent::Image(png_data) => {
+                return vec![BsyncEffect::BroadcastImage {
+                    origin: self.peer_id.clone(),
+                    png_data: png_data.clone(),
+                }]
+            }
         };
 
         vec![BsyncEffect::BroadcastMessage { message }]

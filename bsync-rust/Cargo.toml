@@ -12,8 +12,9 @@ path = "src/lib.rs"
 bsync-core = { path = "../bsync-core" }
 iroh = "=1.0.0"
 iroh-gossip = "=0.101.0"
+iroh-blobs = "=0.103.0"
 clipboard-rs = { version = "0.3", features = ["wayland"] }
-tokio = { version = "1", features = ["sync", "fs"] }
+tokio = { version = "1", features = ["sync", "fs", "io-util"] }
 anyhow = "1"
 dirs = "6"
 blake3 = "1"

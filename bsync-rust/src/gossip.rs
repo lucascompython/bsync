@@ -7,6 +7,8 @@ use iroh_gossip::{
     Gossip, TopicId,
 };
 
+use crate::blobs::BlobsHandle;
+
 /// Topic derived from room name: blake3("bsync-clipboard-v1:" + room) → 32 bytes.
 pub fn derive_topic(room: &str) -> TopicId {
     let hash = blake3::hash(format!("bsync-clipboard-v1:{room}").as_bytes());
@@ -19,6 +21,7 @@ pub struct GossipHandle {
     pub endpoint: Endpoint,
     pub router: Router,
     pub gossip: Gossip,
+    pub blobs: BlobsHandle,
     pub sender: GossipSender,
     pub receiver: GossipReceiver,
 }
@@ -36,9 +39,11 @@ pub async fn setup(
         .context("failed to bind iroh endpoint")?;
 
     let gossip = Gossip::builder().spawn(endpoint.clone());
+    let blobs = BlobsHandle::new();
 
     let router = Router::builder(endpoint.clone())
         .accept(iroh_gossip::ALPN, gossip.clone())
+        .accept(iroh_blobs::ALPN, blobs.blobs.clone())
         .spawn();
 
     let topic_id = derive_topic(room);
@@ -53,6 +58,7 @@ pub async fn setup(
         endpoint,
         router,
         gossip,
+        blobs,
         sender,
         receiver,
     })

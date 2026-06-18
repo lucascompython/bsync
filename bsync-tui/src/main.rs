@@ -177,7 +177,7 @@ async fn run_tui_loop(
             maybe_event = event_stream.next() => {
                 if let Some(Ok(Event::Key(key))) = maybe_event
                     && key.kind == KeyEventKind::Press {
-                        handle_tui_key(&mut app, key, &gh.sender).await?;
+                        handle_tui_key(&mut app, key, &gh).await?;
                     }
 
             }
@@ -187,14 +187,14 @@ async fn run_tui_loop(
                     BsyncEvent::LocalClipboardChanged { content }
                 );
                 for effect in effects {
-                    dispatch_effect(effect, &gh.sender, &app.clipboard_ctx).await?;
+                    dispatch_effect(effect, &gh, &app.clipboard_ctx).await?;
                 }
             }
 
             result = gh.receiver.next() => {
                 match result {
                     Some(Ok(event)) => {
-                        handle_gossip_event_tui(event, &mut app, &gh.sender).await?;
+                        handle_gossip_event_tui(event, &mut app, &gh).await?;
                     }
                     Some(Err(e)) => {
                         app.dialog = Some(Dialog::Error {
@@ -221,13 +221,13 @@ async fn run_tui_loop(
 async fn handle_tui_key(
     app: &mut app::App,
     key: crossterm::event::KeyEvent,
-    sender: &iroh_gossip::api::GossipSender,
+    gh: &gossip::GossipHandle,
 ) -> anyhow::Result<()> {
     use app::Tab;
     use crossterm::event::KeyCode;
 
     if app.dialog.is_some() {
-        return handle_dialog_key(app, key, sender).await;
+        return handle_dialog_key(app, key, gh).await;
     }
 
     match key.code {
@@ -256,7 +256,7 @@ async fn handle_tui_key(
                     id: peer_id.clone(),
                 });
                 for effect in effects {
-                    dispatch_effect(effect, sender, &app.clipboard_ctx).await?;
+                    dispatch_effect(effect, gh, &app.clipboard_ctx).await?;
                 }
             }
         }
@@ -267,7 +267,7 @@ async fn handle_tui_key(
                     id: peer_id.clone(),
                 });
                 for effect in effects {
-                    dispatch_effect(effect, sender, &app.clipboard_ctx).await?;
+                    dispatch_effect(effect, gh, &app.clipboard_ctx).await?;
                 }
             }
         }
@@ -280,7 +280,7 @@ async fn handle_tui_key(
 async fn handle_dialog_key(
     app: &mut app::App,
     key: crossterm::event::KeyEvent,
-    sender: &iroh_gossip::api::GossipSender,
+    gh: &gossip::GossipHandle,
 ) -> anyhow::Result<()> {
     use app::Dialog;
     use crossterm::event::{KeyCode, KeyModifiers};
@@ -294,7 +294,7 @@ async fn handle_dialog_key(
                     .core
                     .process_event(BsyncEvent::PeerApproved { id: peer_id });
                 for effect in effects {
-                    dispatch_effect(effect, sender, &app.clipboard_ctx).await?;
+                    dispatch_effect(effect, gh, &app.clipboard_ctx).await?;
                 }
             }
             KeyCode::Char('n') => {
@@ -302,7 +302,7 @@ async fn handle_dialog_key(
                     .core
                     .process_event(BsyncEvent::PeerRejected { id: peer_id });
                 for effect in effects {
-                    dispatch_effect(effect, sender, &app.clipboard_ctx).await?;
+                    dispatch_effect(effect, gh, &app.clipboard_ctx).await?;
                 }
             }
             KeyCode::Esc => {}
@@ -352,7 +352,7 @@ async fn handle_dialog_key(
 async fn handle_gossip_event_tui(
     event: GossipEvent,
     app: &mut app::App,
-    sender: &iroh_gossip::api::GossipSender,
+    gh: &gossip::GossipHandle,
 ) -> anyhow::Result<()> {
     use app::Dialog;
 
@@ -363,8 +363,22 @@ async fn handle_gossip_event_tui(
                     GossipMessage::ClipboardText { origin, content } => {
                         (origin, bsync_core::ClipboardContent::Text(content))
                     }
-                    GossipMessage::ClipboardImage { origin, png_data } => {
-                        (origin, bsync_core::ClipboardContent::Image(png_data))
+                    GossipMessage::ClipboardImage { origin, hash } => {
+                        let hash = iroh_blobs::Hash::from_bytes(hash);
+                        let from: iroh::EndpointId = origin
+                            .parse()
+                            .context("invalid origin endpoint id in image message")?;
+                        match gh.blobs.download(hash, from, &gh.endpoint).await {
+                            Ok(png_data) => {
+                                (origin, bsync_core::ClipboardContent::Image(png_data))
+                            }
+                            Err(e) => {
+                                app.dialog = Some(Dialog::Error {
+                                    message: format!("Image download failed: {e}"),
+                                });
+                                return Ok(());
+                            }
+                        }
                     }
                 };
                 let effects = app.core.process_event(BsyncEvent::RemoteMessageReceived {
@@ -372,7 +386,7 @@ async fn handle_gossip_event_tui(
                     content,
                 });
                 for effect in effects {
-                    dispatch_effect(effect, sender, &app.clipboard_ctx).await?;
+                    dispatch_effect(effect, gh, &app.clipboard_ctx).await?;
                 }
             }
         }
@@ -386,7 +400,7 @@ async fn handle_gossip_event_tui(
                         peer_id: peer_id.clone(),
                     });
                 }
-                dispatch_effect(effect, sender, &app.clipboard_ctx).await?;
+                dispatch_effect(effect, gh, &app.clipboard_ctx).await?;
             }
         }
         GossipEvent::NeighborDown(id) => {
@@ -394,7 +408,7 @@ async fn handle_gossip_event_tui(
                 .core
                 .process_event(BsyncEvent::PeerDisconnected { id: id.to_string() });
             for effect in effects {
-                dispatch_effect(effect, sender, &app.clipboard_ctx).await?;
+                dispatch_effect(effect, gh, &app.clipboard_ctx).await?;
             }
         }
         GossipEvent::Lagged => {
@@ -409,7 +423,7 @@ async fn handle_gossip_event_tui(
 
 async fn dispatch_effect(
     effect: BsyncEffect,
-    sender: &iroh_gossip::api::GossipSender,
+    gh: &gossip::GossipHandle,
     clipboard_ctx: &Option<clipboard_rs::ClipboardContext>,
 ) -> anyhow::Result<()> {
     match effect {
@@ -421,7 +435,24 @@ async fn dispatch_effect(
         BsyncEffect::BroadcastMessage { message } => {
             let payload = serde_json::to_vec(&message)?;
             if payload.len() <= MAX_MESSAGE_SIZE {
-                sender.broadcast(payload.into()).await?;
+                gh.sender.broadcast(payload.into()).await?;
+            }
+        }
+        BsyncEffect::BroadcastImage { origin, png_data } => {
+            // Upload PNG bytes to the blob store, then broadcast just the hash over gossip.
+            // The hash is 32 bytes — tiny compared to the raw PNG data.
+            match gh.blobs.add(&png_data).await {
+                Ok(hash) => {
+                    let message = GossipMessage::ClipboardImage {
+                        origin,
+                        hash: *hash.as_bytes(),
+                    };
+                    let payload = serde_json::to_vec(&message)?;
+                    gh.sender.broadcast(payload.into()).await?;
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!("failed to add image blob: {e}"));
+                }
             }
         }
         BsyncEffect::PrintStatus { .. }
