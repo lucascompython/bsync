@@ -32,9 +32,3 @@ Wire up the UI frontends, add features like selective sync, file transfer, end-t
 - jetpack compose
 - gtk
 - ratatui
-
-### Architecture reviews
-
-- take a look at iroh-blobs and check if it works on browser
-- why are we using clipboard-rs and arboard? From my understanding both can read and write to the clipboard, but clipboard-rs can read events while arboard can't (correct me if im wrong)
-- tradeoffs between putting the keyboard listening and writting in the rust core instead of implementing it in the native languages that will be used for the UI frontends.
