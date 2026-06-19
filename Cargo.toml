@@ -1,3 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["bsync-core", "bsync-rust", "bsync-tui"]
+
+[profile.release]
+codegen-units = 1 # Allows LLVM to perform better optimization.
+lto = true        # Enables link-time-optimizations.
+panic = "abort"   # Higher performance by disabling panic handlers.
+strip = true      # Ensures debug symbols are removed.
