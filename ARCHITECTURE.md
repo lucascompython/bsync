@@ -31,6 +31,7 @@
 | Image/HTML/file sync | | ✅ |
 | UI frontends (Crux, etc.) | | ✅ |
 | TUI frontend (ratatui) | ✅ |
+| GTK frontend (Linux, gtk-rs) | | ✅ |
 | boltffi native bindings | | ✅ |
 | Selective sync / filtering | | ✅ |
 | End-to-end encryption (app-level) | | ✅ |
@@ -499,24 +500,29 @@ crossterm    = { version = "0.29", features = ["event-stream"] }
 - **Manual test**: Ctrl+C → clean shutdown. Two peers → status messages show connection state.
 
 ## 9. Frontend / Platform Matrix
+| Frontend | Shell type | Clipboard | Async runtime | `bsync-core` access | `bsync-net` access |
+|---|---|---|---|---|---|
+| CLI/TUI (ratatui) | Rust | clipboard-rs (Rust) | tokio | direct | direct |
+| GTK-rs (Linux) | Rust | GDK clipboard (native GTK) | glib main loop | direct | direct |
+| WinUI3 (Windows) | Native C# | DataTransfer.Clipboard (native) | C# async/await | FFI (boltffi) | FFI (boltffi) |
+| SwiftUI (macOS) | Native Swift | NSPasteboard (native) | Swift async/await | FFI (boltffi) | FFI (boltffi) |
+| SwiftUI (iOS) | Native Swift | UIPasteboard (native) | Swift async/await | FFI (boltffi) | FFI (boltffi) |
+| Jetpack Compose (Android) | Native Kotlin | ClipboardManager (native) | Kotlin coroutines | FFI (JNI) | FFI (JNI) |
+| Svelte (web) | Native JS | navigator.clipboard (native) | `wasm-bindgen-futures` | WASM direct | WASM direct |
 
-| Frontend | Clipboard watching | Clipboard writing | Echo guard | Async runtime |
-|---|---|---|---|---|
-| CLI (ratatui/none) | clipboard-rs (Rust) | clipboard-rs (Rust) | Core (hash-based) | tokio `rt-multi-thread` |
-| winui3 (Windows) | clipboard-rs (Rust via boltffi) | clipboard-rs (Rust via boltffi) | Core (hash-based) | tokio `rt-multi-thread` |
-| swiftui (macOS) | clipboard-rs or native NSPasteboard | clipboard-rs or native NSPasteboard | Core (hash-based) | tokio `rt-multi-thread` |
-| swiftui (iOS) | UIPasteboard (native Swift) | UIPasteboard (native Swift) | Core (hash-based) | native async |
-| jetpack compose (Android) | ClipboardManager (native Kotlin) | ClipboardManager (native Kotlin) | Core (hash-based) | native async |
-| svelte (web) | navigator.clipboard (native JS) | navigator.clipboard (native JS) | Core (hash-based) | `wasm-bindgen-futures` |
+**Two shell families:**
 
-**Key insight**: Rust clipboard crates (clipboard-rs, arboard) do NOT compile for iOS, Android, or wasm. Mobile/web frontends MUST use native clipboard APIs. The echo guard lives in `BsyncCore` so it works uniformly across all platforms.
+**Rust shells** (TUI, GTK-rs): use Rust crates directly. clipboard-rs for clipboard (TUI) or native GTK clipboard (GTK-rs). tokio for async. `bsync-core` and `bsync-net` are normal Rust dependencies — no FFI overhead.
+
+**Native shells** (SwiftUI, Compose, WinUI3, Svelte): use platform-native APIs for clipboard and async. `bsync-core` and `bsync-net` are accessed via FFI (boltffi for Swift/C#, JNI for Kotlin, WASM for JS). The echo guard lives in `BsyncCore` so it works uniformly across all platforms.
+
+**GTK-rs specific notes:** GTK-rs uses `gdk::Clipboard` for clipboard operations and `glib::spawn_local` or `tokio_glib` for async bridging. The GTK shell can use `bsync-core` and `bsync-net` as normal Rust deps. For clipboard watching, connect to GTK's `Clipboard::connect_local("changed", ...)` signal.
 
 ## 10. Browser / Svelte Frontend
 
 iroh, iroh-gossip, and iroh-blobs all compile to `wasm32-unknown-unknown` and work in-browser via WebSocket relay transport (since iroh v0.33; iroh-blobs since Nov 2025). The Svelte frontend compiles `bsync-core` + `bsync-net` directly to WASM — no Tauri wrapper or relay bridge required. `bsync-net`'s `Cargo.toml` includes target-conditional feature flags verified by a build spike.
 
 **Limitations:**
-1. **Relay-only transport** — no direct UDP/hole-punching. All traffic via WebSocket relay. Latency ~50–200ms relay hop. Irrelevant for clipboard text (tiny payloads). Matters for large file transfer post-MVP.
 2. **MemStore only** (no FsStore) — iroh-blobs content lives in WASM memory only. No persistence across page reloads. Fine for clipboard text (ephemeral). Custom IndexedDB-backed `Store` needed for persistent file sharing.
 3. **No mDNS / no DHT** — browser peers cannot auto-discover on LAN. Ticket-based connection only (already the MVP design). The deferred "auto-discovery / mDNS" feature will NEVER work in-browser.
 4. **tokio `rt-multi-thread` not WASM-compatible** — browser shell uses single-threaded executor (`wasm-bindgen-futures` / `spawn_local`).
