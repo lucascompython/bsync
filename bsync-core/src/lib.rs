@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Instant, SystemTime};
 
 /// Maximum size of a serialized gossip message (1 MB).
@@ -19,8 +19,6 @@ pub const TICKET_VERSION: u8 = 1;
 pub struct Config {
     /// Human-readable peer ID (iroh EndpointId as string).
     pub peer_id: String,
-    /// Room name for logical isolation.
-    pub room: String,
     /// Skip peer approval prompts (dangerous for clipboard data).
     pub auto_accept: bool,
 }
@@ -117,16 +115,21 @@ impl ClipboardContent {
     }
 }
 
-#[derive(Debug, Clone)]
 pub enum BsyncEvent {
     StartEndpoint,
-    ConnectToPeer { ticket: String },
+    /// Create a new local room. Core adds it to state and emits SetupRoom.
+    CreateRoom { room: String },
+    /// Join a room via a peer's ticket. Core adds the room and emits
+    /// SetupRoom + AddPeer so the shell creates a Network and bootstraps.
+    JoinRoom { ticket: String },
+    /// Remove a room and drop all its connections.
+    LeaveRoom { room: String },
     LocalClipboardChanged { content: ClipboardContent },
-    RemoteMessageReceived { from: String, content: ClipboardContent },
-    PeerConnected { id: String },
-    PeerDisconnected { id: String },
-    PeerApproved { id: String },
-    PeerRejected { id: String },
+    RemoteMessageReceived { room: String, from: String, content: ClipboardContent },
+    PeerConnected { room: String, id: String },
+    PeerDisconnected { room: String, id: String },
+    PeerApproved { room: String, id: String },
+    PeerRejected { room: String, id: String },
     Shutdown,
 }
 
@@ -136,11 +139,18 @@ pub enum BsyncEffect {
         content: ClipboardContent,
         write_hash: [u8; 32],
     },
-    BroadcastMessage { message: GossipMessage },
-    BroadcastImage { origin: String, png_data: Vec<u8> },
+    /// Broadcast a text message in a specific room.
+    BroadcastMessage { room: String, message: GossipMessage },
+    /// Broadcast an image in a specific room. Shell uploads blob then broadcasts hash.
+    BroadcastImage { room: String, origin: String, png_data: Vec<u8> },
     PrintStatus { message: String },
-    PromptApproval { peer_id: String },
-    ConnectToEndpoint { endpoint_addr: String },
+    PromptApproval { room: String, peer_id: String },
+    /// Shell should create a Network for this room.
+    SetupRoom { room: String, ticket: String },
+    /// Shell should shut down and remove the Network for this room.
+    ShutdownRoom { room: String },
+    /// Shell should add a peer as bootstrap to the room's Network.
+    AddPeer { room: String, endpoint_addr: String },
     Shutdown,
 }
 
@@ -160,27 +170,49 @@ pub struct ClipboardHistoryEntry {
 }
 
 #[derive(Debug, Clone)]
+pub struct RoomViewModel {
+    /// Room name (= gossip topic name).
+    pub name: String,
+    /// `true` if this room was created locally (I own the ticket).
+    /// `false` if I joined this room via someone else's ticket.
+    pub is_local: bool,
+    /// Ticket for this room. Only present for local rooms.
+    pub ticket: Option<String>,
+    /// Peers connected in this room.
+    pub connected_peers: Vec<String>,
+    /// Peers pending approval in this room.
+    pub pending_peers: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct BsyncViewModel {
     pub peer_id: String,
-    pub ticket: String,
-    pub room: String,
-    pub connected_peers: Vec<String>,
-    pub pending_peers: Vec<String>,
+    pub rooms: Vec<RoomViewModel>,
     pub status: String,
     pub history: Vec<ClipboardHistoryEntry>,
 }
 
+/// Per-room state. Lives inside BsyncCore (no I/O).
+#[derive(Debug, Clone)]
+pub struct RoomState {
+    /// `true` if this room was created locally (I own the ticket).
+    pub is_local: bool,
+    /// Peers connected in this room.
+    pub connected_peers: Vec<String>,
+    /// Peers pending approval in this room.
+    pub pending_peers: Vec<String>,
+}
+
 pub struct BsyncCore {
     peer_id: String,
-    room: String,
     auto_accept: bool,
-    connected_peers: Vec<String>,
-    pending_peers: Vec<String>,
-    /// Hash of the last remote content we applied (dedup).
+    /// All active rooms, keyed by room name.
+    rooms: HashMap<String, RoomState>,
+    /// Hash of the last remote content we applied (dedup, global).
     last_applied_hash: Option<blake3::Hash>,
-    /// Hash of the content we just wrote to clipboard (echo guard).
+    /// Hash of the content we just wrote to clipboard (echo guard, global).
     pending_write_hash: Option<blake3::Hash>,
-    /// Timestamps of recent broadcasts (rate limiting).
+    /// Timestamps of recent broadcasts (rate limiting, global).
     broadcast_times: VecDeque<Instant>,
     /// Ring buffer of recent clipboard entries (newest first).
     history: VecDeque<ClipboardHistoryEntry>,
@@ -191,10 +223,8 @@ impl BsyncCore {
     pub fn new(config: Config) -> Self {
         Self {
             peer_id: config.peer_id,
-            room: config.room,
             auto_accept: config.auto_accept,
-            connected_peers: Vec::new(),
-            pending_peers: Vec::new(),
+            rooms: HashMap::new(),
             last_applied_hash: None,
             pending_write_hash: None,
             broadcast_times: VecDeque::with_capacity(MAX_BROADCASTS_PER_SEC),
@@ -207,52 +237,114 @@ impl BsyncCore {
     pub fn process_event(&mut self, event: BsyncEvent) -> Vec<BsyncEffect> {
         match event {
             BsyncEvent::StartEndpoint => self.handle_start(),
-            BsyncEvent::ConnectToPeer { ticket } => self.handle_connect(ticket),
+            BsyncEvent::CreateRoom { room } => self.handle_create_room(room),
+            BsyncEvent::JoinRoom { ticket } => self.handle_join_room(ticket),
+            BsyncEvent::LeaveRoom { room } => self.handle_leave_room(room),
             BsyncEvent::LocalClipboardChanged { content } => self.handle_local_change(content),
-            BsyncEvent::RemoteMessageReceived { from, content } => {
-                self.handle_remote_message(from, content)
+            BsyncEvent::RemoteMessageReceived { room, from, content } => {
+                self.handle_remote_message(room, from, content)
             }
-            BsyncEvent::PeerConnected { id } => self.handle_peer_connected(id),
-            BsyncEvent::PeerDisconnected { id } => self.handle_peer_disconnected(id),
-            BsyncEvent::PeerApproved { id } => self.handle_peer_approved(id),
-            BsyncEvent::PeerRejected { id } => self.handle_peer_rejected(id),
+            BsyncEvent::PeerConnected { room, id } => self.handle_peer_connected(room, id),
+            BsyncEvent::PeerDisconnected { room, id } => self.handle_peer_disconnected(room, id),
+            BsyncEvent::PeerApproved { room, id } => self.handle_peer_approved(room, id),
+            BsyncEvent::PeerRejected { room, id } => self.handle_peer_rejected(room, id),
             BsyncEvent::Shutdown => self.handle_shutdown(),
         }
     }
 
     /// Read-only snapshot for UI rendering.
     pub fn view(&self) -> BsyncViewModel {
+        let rooms = self
+            .rooms
+            .iter()
+            .map(|(name, state)| RoomViewModel {
+                name: name.clone(),
+                is_local: state.is_local,
+                ticket: if state.is_local {
+                    Some(Ticket::new(self.peer_id.clone(), name.clone()).encode())
+                } else {
+                    None
+                },
+                connected_peers: state.connected_peers.clone(),
+                pending_peers: state.pending_peers.clone(),
+            })
+            .collect();
         BsyncViewModel {
             peer_id: self.peer_id.clone(),
-            ticket: Ticket::new(self.peer_id.clone(), self.room.clone()).encode(),
-            room: self.room.clone(),
-            connected_peers: self.connected_peers.clone(),
-            pending_peers: self.pending_peers.clone(),
+            rooms,
             status: self.status.clone(),
             history: self.history.iter().rev().cloned().collect(),
         }
     }
 
     fn handle_start(&mut self) -> Vec<BsyncEffect> {
-        let ticket = Ticket::new(self.peer_id.clone(), self.room.clone()).encode();
-        self.status = "waiting for connections...".into();
+        self.status = "ready".into();
         vec![BsyncEffect::PrintStatus {
-            message: format!("Ticket:  {}\nRoom:    {}\n", ticket, self.room),
+            message: "bsync ready. Create a room with --room <name> or press 'n'.".into(),
         }]
     }
 
-    fn handle_connect(&mut self, ticket_str: String) -> Vec<BsyncEffect> {
+    fn handle_create_room(&mut self, room: String) -> Vec<BsyncEffect> {
+        if self.rooms.contains_key(&room) {
+            return vec![BsyncEffect::PrintStatus {
+                message: format!("Room '{room}' already exists"),
+            }];
+        }
+        let ticket = Ticket::new(self.peer_id.clone(), room.clone()).encode();
+        self.rooms.insert(
+            room.clone(),
+            RoomState {
+                is_local: true,
+                connected_peers: Vec::new(),
+                pending_peers: Vec::new(),
+            },
+        );
+        self.status = format!("created room '{room}'");
+        vec![
+            BsyncEffect::SetupRoom { room: room.clone(), ticket: ticket.clone() },
+            BsyncEffect::PrintStatus {
+                message: format!("Room '{room}' created. Share: {ticket}"),
+            },
+        ]
+    }
+
+    fn handle_join_room(&mut self, ticket_str: String) -> Vec<BsyncEffect> {
         match Ticket::decode(&ticket_str) {
             Ok(ticket) => {
-                self.status = format!("connecting to {}...", ticket.endpoint_addr);
-                vec![BsyncEffect::ConnectToEndpoint {
-                    endpoint_addr: ticket.endpoint_addr,
-                }]
+                let room = ticket.room.clone();
+                self.rooms.entry(room.clone()).or_insert(RoomState {
+                    is_local: false,
+                    connected_peers: Vec::new(),
+                    pending_peers: Vec::new(),
+                });
+                self.status = format!("joining room '{room}'");
+                vec![
+                    BsyncEffect::SetupRoom { room: room.clone(), ticket: ticket_str },
+                    BsyncEffect::AddPeer {
+                        room,
+                        endpoint_addr: ticket.endpoint_addr,
+                    },
+                ]
             }
             Err(e) => vec![BsyncEffect::PrintStatus {
                 message: format!("Invalid ticket: {e}"),
             }],
         }
+    }
+
+    fn handle_leave_room(&mut self, room: String) -> Vec<BsyncEffect> {
+        if self.rooms.remove(&room).is_none() {
+            return vec![BsyncEffect::PrintStatus {
+                message: format!("Room '{room}' not found"),
+            }];
+        }
+        self.status = format!("left room '{room}'");
+        vec![
+            BsyncEffect::ShutdownRoom { room: room.clone() },
+            BsyncEffect::PrintStatus {
+                message: format!("Left room '{room}'"),
+            },
+        ]
     }
 
     fn handle_local_change(&mut self, content: ClipboardContent) -> Vec<BsyncEffect> {
@@ -274,24 +366,45 @@ impl BsyncCore {
         self.broadcast_times.push_back(Instant::now());
         self.status = "syncing...".into();
 
-        let message = match &content {
-            ClipboardContent::Text(text) => GossipMessage::ClipboardText {
-                origin: self.peer_id.clone(),
-                content: text.clone(),
-            },
-            ClipboardContent::Image(png_data) => {
-                return vec![BsyncEffect::BroadcastImage {
-                    origin: self.peer_id.clone(),
-                    png_data: png_data.clone(),
-                }]
+        // Broadcast to all rooms with at least one connected peer.
+        let mut effects = Vec::new();
+        for (room_name, room_state) in &self.rooms {
+            if room_state.connected_peers.is_empty() {
+                continue;
             }
-        };
-
-        vec![BsyncEffect::BroadcastMessage { message }]
+            match &content {
+                ClipboardContent::Text(text) => {
+                    effects.push(BsyncEffect::BroadcastMessage {
+                        room: room_name.clone(),
+                        message: GossipMessage::ClipboardText {
+                            origin: origin.clone(),
+                            content: text.clone(),
+                        },
+                    });
+                }
+                ClipboardContent::Image(png_data) => {
+                    effects.push(BsyncEffect::BroadcastImage {
+                        room: room_name.clone(),
+                        origin: origin.clone(),
+                        png_data: png_data.clone(),
+                    });
+                }
+            }
+        }
+        effects
     }
 
-    fn handle_remote_message(&mut self, from: String, content: ClipboardContent) -> Vec<BsyncEffect> {
-        if !self.connected_peers.contains(&from) {
+    fn handle_remote_message(
+        &mut self,
+        room: String,
+        from: String,
+        content: ClipboardContent,
+    ) -> Vec<BsyncEffect> {
+        let authorized = self
+            .rooms
+            .get(&room)
+            .is_some_and(|rs| rs.connected_peers.contains(&from));
+        if !authorized {
             return vec![];
         }
 
@@ -311,47 +424,58 @@ impl BsyncCore {
         }]
     }
 
-    fn handle_peer_connected(&mut self, id: String) -> Vec<BsyncEffect> {
-        if self.connected_peers.contains(&id) || self.pending_peers.contains(&id) {
+    fn handle_peer_connected(&mut self, room: String, id: String) -> Vec<BsyncEffect> {
+        let Some(rs) = self.rooms.get_mut(&room) else {
+            return vec![];
+        };
+        if rs.connected_peers.contains(&id) || rs.pending_peers.contains(&id) {
             return vec![];
         }
 
         if self.auto_accept {
-            self.connected_peers.push(id.clone());
-            self.status = format!("connected to {id}");
+            rs.connected_peers.push(id.clone());
+            self.status = format!("[{room}] connected to {id}");
             vec![BsyncEffect::PrintStatus {
-                message: format!("Peer connected: {id} (auto-accepted)"),
+                message: format!("[{room}] Peer connected: {id} (auto-accepted)"),
             }]
         } else {
-            self.pending_peers.push(id.clone());
-            vec![BsyncEffect::PromptApproval { peer_id: id }]
+            rs.pending_peers.push(id.clone());
+            vec![BsyncEffect::PromptApproval {
+                room: room.clone(),
+                peer_id: id,
+            }]
         }
     }
 
-    fn handle_peer_disconnected(&mut self, id: String) -> Vec<BsyncEffect> {
-        self.connected_peers.retain(|p| p != &id);
-        self.pending_peers.retain(|p| p != &id);
-        self.status = format!("peer {id} disconnected");
+    fn handle_peer_disconnected(&mut self, room: String, id: String) -> Vec<BsyncEffect> {
+        if let Some(rs) = self.rooms.get_mut(&room) {
+            rs.connected_peers.retain(|p| p != &id);
+            rs.pending_peers.retain(|p| p != &id);
+        }
+        self.status = format!("[{room}] peer {id} disconnected");
         vec![BsyncEffect::PrintStatus {
-            message: format!("Peer disconnected: {id}"),
+            message: format!("[{room}] Peer disconnected: {id}"),
         }]
     }
 
-    fn handle_peer_approved(&mut self, id: String) -> Vec<BsyncEffect> {
-        if let Some(pos) = self.pending_peers.iter().position(|p| p == &id) {
-            self.pending_peers.remove(pos);
-            self.connected_peers.push(id.clone());
-            self.status = format!("connected to {id}");
-            vec![BsyncEffect::PrintStatus {
-                message: format!("Peer approved: {id}"),
-            }]
-        } else {
-            vec![]
+    fn handle_peer_approved(&mut self, room: String, id: String) -> Vec<BsyncEffect> {
+        if let Some(rs) = self.rooms.get_mut(&room)
+            && let Some(pos) = rs.pending_peers.iter().position(|p| p == &id)
+        {
+            rs.pending_peers.remove(pos);
+            rs.connected_peers.push(id.clone());
+            self.status = format!("[{room}] connected to {id}");
+            return vec![BsyncEffect::PrintStatus {
+                message: format!("[{room}] Peer approved: {id}"),
+            }];
         }
+        vec![]
     }
 
-    fn handle_peer_rejected(&mut self, id: String) -> Vec<BsyncEffect> {
-        self.pending_peers.retain(|p| p != &id);
+    fn handle_peer_rejected(&mut self, room: String, id: String) -> Vec<BsyncEffect> {
+        if let Some(rs) = self.rooms.get_mut(&room) {
+            rs.pending_peers.retain(|p| p != &id);
+        }
         vec![BsyncEffect::PrintStatus {
             message: format!("Peer rejected: {id}"),
         }]
@@ -359,7 +483,14 @@ impl BsyncCore {
 
     fn handle_shutdown(&mut self) -> Vec<BsyncEffect> {
         self.status = "shutting down...".into();
-        vec![BsyncEffect::Shutdown]
+        let mut effects: Vec<BsyncEffect> = self
+            .rooms
+            .keys()
+            .cloned()
+            .map(|room| BsyncEffect::ShutdownRoom { room })
+            .collect();
+        effects.push(BsyncEffect::Shutdown);
+        effects
     }
 
     /// Remove broadcast timestamps older than 1 second.
@@ -398,31 +529,37 @@ mod tests {
     use super::*;
 
     fn test_core() -> BsyncCore {
-        BsyncCore::new(Config {
+        let mut core = BsyncCore::new(Config {
             peer_id: "test-peer-1".into(),
-            room: "test-room".into(),
             auto_accept: false,
-        })
+        });
+        let _ = core.process_event(BsyncEvent::CreateRoom {
+            room: "test-room".into(),
+        });
+        core
     }
 
     /// Helper: connect + approve a peer so its messages pass the approval gate.
     fn connect_peer(core: &mut BsyncCore, id: &str) {
-        core.process_event(BsyncEvent::PeerConnected { id: id.into() });
-        core.process_event(BsyncEvent::PeerApproved { id: id.into() });
+        core.process_event(BsyncEvent::PeerConnected {
+            room: "test-room".into(),
+            id: id.into(),
+        });
+        core.process_event(BsyncEvent::PeerApproved {
+            room: "test-room".into(),
+            id: id.into(),
+        });
     }
 
     #[test]
-    fn start_produces_ticket() {
+    fn view_includes_rooms() {
         let mut core = test_core();
-        let effects = core.process_event(BsyncEvent::StartEndpoint);
-        assert_eq!(effects.len(), 1);
-        match &effects[0] {
-            BsyncEffect::PrintStatus { message } => {
-                assert!(message.contains("Ticket:"));
-                assert!(message.contains("Room:"));
-            }
-            _ => panic!("expected PrintStatus"),
-        }
+        let view = core.view();
+        assert_eq!(view.rooms.len(), 1);
+        assert_eq!(view.rooms[0].name, "test-room");
+        assert!(view.rooms[0].is_local);
+        assert!(view.rooms[0].ticket.is_some());
+        assert!(!view.rooms[0].ticket.as_ref().unwrap().is_empty());
     }
 
     #[test]
@@ -455,7 +592,7 @@ mod tests {
         connect_peer(&mut core, "peer-2");
 
         // Simulate remote message → WriteClipboard sets pending_write_hash
-        let effects = core.process_event(BsyncEvent::RemoteMessageReceived {
+        let effects = core.process_event(BsyncEvent::RemoteMessageReceived { room: "test-room".into(),
             from: "peer-2".into(),
             content: ClipboardContent::Text("hello".into()),
         });
@@ -474,7 +611,7 @@ mod tests {
         connect_peer(&mut core, "peer-2");
 
         // Write from remote → pending_write_hash set
-        core.process_event(BsyncEvent::RemoteMessageReceived {
+        core.process_event(BsyncEvent::RemoteMessageReceived { room: "test-room".into(),
             from: "peer-2".into(),
             content: ClipboardContent::Text("hello".into()),
         });
@@ -491,6 +628,7 @@ mod tests {
         assert_eq!(effects.len(), 1);
         match &effects[0] {
             BsyncEffect::BroadcastMessage {
+                room: _,
                 message: GossipMessage::ClipboardText { origin, content },
             } => {
                 assert_eq!(origin, "test-peer-1");
@@ -505,13 +643,13 @@ mod tests {
         let mut core = test_core();
         connect_peer(&mut core, "peer-2");
 
-        let effects1 = core.process_event(BsyncEvent::RemoteMessageReceived {
+        let effects1 = core.process_event(BsyncEvent::RemoteMessageReceived { room: "test-room".into(),
             from: "peer-2".into(),
             content: ClipboardContent::Text("dup".into()),
         });
         assert_eq!(effects1.len(), 1);
 
-        let effects2 = core.process_event(BsyncEvent::RemoteMessageReceived {
+        let effects2 = core.process_event(BsyncEvent::RemoteMessageReceived { room: "test-room".into(),
             from: "peer-2".into(),
             content: ClipboardContent::Text("dup".into()),
         });
@@ -523,45 +661,46 @@ mod tests {
         let mut core = test_core();
 
         // Peer connects → prompt
-        let effects = core.process_event(BsyncEvent::PeerConnected { id: "p2".into() });
+        let effects = core.process_event(BsyncEvent::PeerConnected { room: "test-room".into(), id: "p2".into() });
         assert_eq!(effects.len(), 1);
         assert!(matches!(effects[0], BsyncEffect::PromptApproval { .. }));
 
         // User approves → peer moves to connected
-        let effects = core.process_event(BsyncEvent::PeerApproved { id: "p2".into() });
+        let effects = core.process_event(BsyncEvent::PeerApproved { room: "test-room".into(), id: "p2".into() });
         assert_eq!(effects.len(), 1);
 
         let view = core.view();
-        assert!(view.connected_peers.contains(&"p2".to_string()));
-        assert!(view.pending_peers.is_empty());
+        assert!(view.rooms[0].connected_peers.contains(&"p2".to_string()));
+        assert!(view.rooms[0].pending_peers.is_empty());
     }
 
     #[test]
     fn peer_rejected_does_not_connect() {
         let mut core = test_core();
 
-        core.process_event(BsyncEvent::PeerConnected { id: "p2".into() });
-        core.process_event(BsyncEvent::PeerRejected { id: "p2".into() });
+        core.process_event(BsyncEvent::PeerConnected { room: "test-room".into(), id: "p2".into() });
+        core.process_event(BsyncEvent::PeerRejected { room: "test-room".into(), id: "p2".into() });
 
         let view = core.view();
-        assert!(view.connected_peers.is_empty());
-        assert!(view.pending_peers.is_empty());
+        assert!(view.rooms[0].connected_peers.is_empty());
+        assert!(view.rooms[0].pending_peers.is_empty());
     }
 
     #[test]
     fn auto_accept_skips_prompt() {
         let mut core = BsyncCore::new(Config {
             peer_id: "p1".into(),
-            room: "r".into(),
+            
             auto_accept: true,
         });
+        let _ = core.process_event(BsyncEvent::CreateRoom { room: "test-room".into() });
 
-        let effects = core.process_event(BsyncEvent::PeerConnected { id: "p2".into() });
+        let effects = core.process_event(BsyncEvent::PeerConnected { room: "test-room".into(), id: "p2".into() });
         assert_eq!(effects.len(), 1);
         assert!(matches!(effects[0], BsyncEffect::PrintStatus { .. }));
 
         let view = core.view();
-        assert!(view.connected_peers.contains(&"p2".to_string()));
+        assert!(view.rooms[0].connected_peers.contains(&"p2".to_string()));
     }
 
     #[test]
@@ -569,10 +708,10 @@ mod tests {
         let mut core = test_core();
 
         // Peer connects but is NOT approved
-        core.process_event(BsyncEvent::PeerConnected { id: "p2".into() });
+        core.process_event(BsyncEvent::PeerConnected { room: "test-room".into(), id: "p2".into() });
 
         // Message from pending peer → should be dropped
-        let effects = core.process_event(BsyncEvent::RemoteMessageReceived {
+        let effects = core.process_event(BsyncEvent::RemoteMessageReceived { room: "test-room".into(),
             from: "p2".into(),
             content: ClipboardContent::Text("secret".into()),
         });
@@ -582,10 +721,10 @@ mod tests {
         );
 
         // Reject the peer
-        core.process_event(BsyncEvent::PeerRejected { id: "p2".into() });
+        core.process_event(BsyncEvent::PeerRejected { room: "test-room".into(), id: "p2".into() });
 
         // Message from rejected peer → still dropped
-        let effects = core.process_event(BsyncEvent::RemoteMessageReceived {
+        let effects = core.process_event(BsyncEvent::RemoteMessageReceived { room: "test-room".into(),
             from: "p2".into(),
             content: ClipboardContent::Text("secret".into()),
         });
@@ -606,7 +745,7 @@ mod tests {
         });
 
         // Remote receive
-        core.process_event(BsyncEvent::RemoteMessageReceived {
+        core.process_event(BsyncEvent::RemoteMessageReceived { room: "test-room".into(),
             from: "peer-2".into(),
             content: ClipboardContent::Text("remote text".into()),
         });
@@ -654,8 +793,8 @@ mod tests {
     fn view_includes_room() {
         let core = test_core();
         let view = core.view();
-        assert_eq!(view.room, "test-room");
-        assert!(!view.ticket.is_empty());
+        assert_eq!(view.rooms[0].name, "test-room");
+        assert!(!view.rooms[0].ticket.as_ref().unwrap().is_empty());
     }
 
     #[test]
@@ -665,7 +804,7 @@ mod tests {
 
         let png = vec![0x89, 0x50, 0x4e, 0x47]; // fake PNG header
 
-        let effects = core.process_event(BsyncEvent::RemoteMessageReceived {
+        let effects = core.process_event(BsyncEvent::RemoteMessageReceived { room: "test-room".into(),
             from: "peer-2".into(),
             content: ClipboardContent::Image(png.clone()),
         });
@@ -684,17 +823,35 @@ mod tests {
 
         let png = vec![1, 2, 3, 4];
 
-        let effects1 = core.process_event(BsyncEvent::RemoteMessageReceived {
+        let effects1 = core.process_event(BsyncEvent::RemoteMessageReceived { room: "test-room".into(),
             from: "peer-2".into(),
             content: ClipboardContent::Image(png.clone()),
         });
         assert_eq!(effects1.len(), 1);
 
-        let effects2 = core.process_event(BsyncEvent::RemoteMessageReceived {
+        let effects2 = core.process_event(BsyncEvent::RemoteMessageReceived { room: "test-room".into(),
             from: "peer-2".into(),
             content: ClipboardContent::Image(png),
         });
         assert!(effects2.is_empty(), "dedup should skip identical image");
+    }
+
+    #[test]
+    fn create_and_leave_room() {
+        let mut core = test_core();
+        connect_peer(&mut core, "peer-2");
+        assert!(!core.view().rooms[0].connected_peers.is_empty());
+
+        let effects = core.process_event(BsyncEvent::CreateRoom {
+            room: "new-room".into(),
+        });
+        assert!(effects.iter().any(|e| matches!(e, BsyncEffect::SetupRoom { .. })));
+
+        let effects = core.process_event(BsyncEvent::LeaveRoom {
+            room: "new-room".into(),
+        });
+        assert!(effects.iter().any(|e| matches!(e, BsyncEffect::ShutdownRoom { .. })));
+        assert!(core.view().rooms.iter().all(|r| r.name != "new-room"));
     }
 
     #[test]

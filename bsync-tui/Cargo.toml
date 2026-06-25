@@ -12,6 +12,7 @@ path = "src/main.rs"
 bsync-core = { path = "../bsync-core" }
 bsync-net = { path = "../bsync-net" }
 bsync-rust = { path = "../bsync-rust" }
+iroh-base = { version = "=1.0.0", features = ["key"] }
 clipboard-rs = { version = "0.3", features = ["wayland"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "signal", "macros", "io-util", "time"] }
 anyhow = "1"

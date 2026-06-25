@@ -1,42 +1,45 @@
-use bsync_core::{BsyncCore, BsyncEffect, BsyncEvent, BsyncViewModel, Ticket};
-use bsync_net::{Network, parse_endpoint_addr};
+use bsync_core::{BsyncCore, BsyncViewModel};
 use clipboard_rs::Clipboard;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Status,
     Peers,
+    Rooms,
     History,
     Help,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 4] = [Tab::Status, Tab::Peers, Tab::History, Tab::Help];
+    pub const ALL: [Tab; 5] = [Tab::Status, Tab::Peers, Tab::Rooms, Tab::History, Tab::Help];
 
     pub fn title(self) -> &'static str {
         match self {
             Tab::Status => "Status",
             Tab::Peers => "Peers",
+            Tab::Rooms => "Rooms",
             Tab::History => "History",
             Tab::Help => "Help",
         }
     }
 
     pub fn next(self) -> Self {
-        let idx = Self::ALL.iter().position(|&t| t == self).unwrap();
+        let idx = Self::ALL.iter().position(|t| *t == self).unwrap();
         Self::ALL[(idx + 1) % Self::ALL.len()]
     }
 
     pub fn prev(self) -> Self {
-        let idx = Self::ALL.iter().position(|&t| t == self).unwrap();
+        let idx = Self::ALL.iter().position(|t| *t == self).unwrap();
         Self::ALL[(idx + Self::ALL.len() - 1) % Self::ALL.len()]
     }
 }
 
 #[derive(Debug, Clone)]
 pub enum Dialog {
-    Approval { peer_id: String },
+    Approval { room: String, peer_id: String },
     ConnectInput { input: String },
+    RoomCreate { input: String },
+    RoomDelete { room: String },
     Error { message: String },
     Info { message: String },
 }
@@ -45,10 +48,12 @@ pub struct App {
     pub core: BsyncCore,
     pub tab: Tab,
     pub history_scroll: usize,
+    pub rooms_scroll: usize,
     pub dialog: Option<Dialog>,
     pub should_quit: bool,
     pub clipboard_enabled: bool,
-    pub clipboard_ctx: Option<clipboard_rs::ClipboardContext>,
+    /// Transient notification shown in the bottom-right.
+    pub notification: Option<String>,
 }
 
 impl App {
@@ -57,10 +62,11 @@ impl App {
             core,
             tab: Tab::Status,
             history_scroll: 0,
+            rooms_scroll: 0,
             dialog: None,
             should_quit: false,
             clipboard_enabled: true,
-            clipboard_ctx: None,
+            notification: None,
         }
     }
 
@@ -86,18 +92,42 @@ impl App {
         self.history_scroll = self.history_scroll.saturating_sub(1);
     }
 
+    pub fn scroll_rooms_down(&mut self) {
+        self.rooms_scroll = self.rooms_scroll.saturating_add(1);
+    }
+
+    pub fn scroll_rooms_up(&mut self) {
+        self.rooms_scroll = self.rooms_scroll.saturating_sub(1);
+    }
+
     pub fn open_connect_dialog(&mut self) {
         self.dialog = Some(Dialog::ConnectInput {
             input: String::new(),
         });
     }
 
-    pub fn copy_ticket_to_clipboard(&mut self) {
-        if let Some(ctx) = &self.clipboard_ctx {
-            let ticket = self.view().ticket;
-            let _ = ctx.set_text(ticket);
-            self.dialog = Some(Dialog::Info {
-                message: "Ticket copied to clipboard.".into(),
+    pub fn open_room_create_dialog(&mut self) {
+        self.dialog = Some(Dialog::RoomCreate {
+            input: String::new(),
+        });
+    }
+
+    pub fn open_room_delete_dialog(&mut self, room: String) {
+        self.dialog = Some(Dialog::RoomDelete { room });
+    }
+
+    pub fn copy_ticket_to_clipboard(&mut self, clipboard_ctx: &Option<clipboard_rs::ClipboardContext>) {
+        if let Some(ctx) = clipboard_ctx {
+            if let Some(room) = self.view().rooms.iter().find(|r| r.is_local)
+                && let Some(ticket) = &room.ticket {
+                    let _ = ctx.set_text(ticket.clone());
+                    self.dialog = Some(Dialog::Info {
+                        message: format!("Ticket for room '{}' copied to clipboard.", room.name),
+                    });
+                    return;
+                }
+            self.dialog = Some(Dialog::Error {
+                message: "No local rooms available.".into(),
             });
         } else {
             self.dialog = Some(Dialog::Error {
@@ -106,14 +136,46 @@ impl App {
         }
     }
 
-    pub fn recopy_history_item(&mut self) {
+    pub fn copy_room_ticket(
+        &mut self,
+        room_name: &str,
+        clipboard_ctx: &Option<clipboard_rs::ClipboardContext>,
+    ) {
+        if let Some(ctx) = clipboard_ctx {
+            if let Some(room) = self.view().rooms.iter().find(|r| r.name == room_name) {
+                if let Some(ticket) = &room.ticket {
+                    let _ = ctx.set_text(ticket.clone());
+                    self.dialog = Some(Dialog::Info {
+                        message: format!("Ticket for '{room_name}' copied to clipboard."),
+                    });
+                    return;
+                }
+                self.dialog = Some(Dialog::Error {
+                    message: format!("Room '{room_name}' is not a local room — no ticket to copy."),
+                });
+                return;
+            }
+            self.dialog = Some(Dialog::Error {
+                message: format!("Room '{room_name}' not found."),
+            });
+        } else {
+            self.dialog = Some(Dialog::Error {
+                message: "Clipboard is disabled (--no-clipboard).".into(),
+            });
+        }
+    }
+
+    pub fn recopy_history_item(
+        &mut self,
+        clipboard_ctx: &Option<clipboard_rs::ClipboardContext>,
+    ) {
         let view = self.view();
         if view.history.is_empty() {
             return;
         }
         let idx = self.history_scroll.min(view.history.len() - 1);
         if let Some(entry) = view.history.get(idx)
-            && let Some(ctx) = &self.clipboard_ctx
+            && let Some(ctx) = clipboard_ctx
         {
             let _ = bsync_rust::clipboard::write_clipboard(ctx, &entry.content);
             self.dialog = Some(Dialog::Info {
@@ -122,45 +184,6 @@ impl App {
                     &entry.preview[..entry.preview.len().min(40)]
                 ),
             });
-        }
-    }
-
-    pub async fn connect_to_peer(&mut self, ticket_str: String, network: &Network) {
-        match Ticket::decode(&ticket_str) {
-            Ok(ticket) => {
-                let endpoint_addr = ticket.endpoint_addr.clone();
-                let room = ticket.room.clone();
-
-                let effects = self
-                    .core
-                    .process_event(BsyncEvent::ConnectToPeer { ticket: ticket_str });
-
-                for effect in effects {
-                    if let BsyncEffect::ConnectToEndpoint { .. } = effect {
-                        match parse_endpoint_addr(&endpoint_addr) {
-                            Ok(peer_id) => {
-                                let _ = network.add_peer(peer_id).await;
-
-                                self.dialog = Some(Dialog::Info {
-                                    message: format!(
-                                        "Connecting to peer in room '{room}'...\nThe other peer must be in the same room.",
-                                    ),
-                                });
-                            }
-                            Err(e) => {
-                                self.dialog = Some(Dialog::Error {
-                                    message: format!("Invalid endpoint address: {e}"),
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                self.dialog = Some(Dialog::Error {
-                    message: format!("Invalid ticket: {e}"),
-                });
-            }
         }
     }
 }

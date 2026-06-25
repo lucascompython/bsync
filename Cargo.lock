@@ -437,6 +437,7 @@ dependencies = [
  "clipboard-rs",
  "crossterm",
  "futures-lite",
+ "iroh-base",
  "ratatui",
  "tokio",
 ]

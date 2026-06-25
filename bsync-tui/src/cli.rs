@@ -1,7 +1,7 @@
 use bsync_core::{
     BsyncCore, BsyncEffect, BsyncEvent, ClipboardContent, Config, GossipMessage, Ticket,
 };
-use bsync_net::{parse_endpoint_addr, Network, NetworkEvent};
+use bsync_net::{Network, NetworkEvent, parse_endpoint_addr};
 use bsync_rust::{clipboard, identity};
 use tokio::sync::mpsc;
 
@@ -12,38 +12,33 @@ pub async fn run(cli: &CliArgs) -> anyhow::Result<()> {
 
     let mut core = BsyncCore::new(Config {
         peer_id: peer_id_str,
-        room: cli.room.clone(),
         auto_accept: cli.auto_accept,
     });
 
-    for effect in core.process_event(BsyncEvent::StartEndpoint) {
-        print_effect(&effect);
-    }
+    let _ = core.process_event(BsyncEvent::StartEndpoint);
 
-    let mut bootstrap = Vec::new();
-    if let Some(ticket_str) = &cli.connect {
+    // Determine initial room and bootstrap peer.
+    // If --connect is given, use the ticket's room and add the peer as bootstrap.
+    let (room_name, bootstrap) = if let Some(ticket_str) = &cli.connect {
         match Ticket::decode(ticket_str) {
-            Ok(_ticket) => {
-                let effects = core.process_event(BsyncEvent::ConnectToPeer {
-                    ticket: ticket_str.clone(),
-                });
-                for effect in effects {
-                    match effect {
-                        BsyncEffect::ConnectToEndpoint { endpoint_addr } => {
-                            match parse_endpoint_addr(&endpoint_addr) {
-                                Ok(id) => bootstrap.push(id),
-                                Err(e) => eprintln!("Invalid endpoint address in ticket: {e}"),
-                            }
-                        }
-                        other => print_effect(&other),
-                    }
-                }
+            Ok(ticket) => {
+                let peer_id = parse_endpoint_addr(&ticket.endpoint_addr).ok();
+                (ticket.room, peer_id.into_iter().collect())
             }
-            Err(e) => eprintln!("Invalid ticket: {e}"),
+            Err(e) => {
+                eprintln!("Invalid ticket: {e}");
+                return Ok(());
+            }
         }
-    }
+    } else {
+        (cli.room.clone(), vec![])
+    };
 
-    let (network, mut network_rx) = Network::setup(&cli.room, &secret_key, bootstrap).await?;
+    let _ = core.process_event(BsyncEvent::CreateRoom {
+        room: room_name.clone(),
+    });
+
+    let (network, mut network_rx) = Network::setup(&room_name, &secret_key, bootstrap).await?;
 
     let clipboard_ctx: Option<clipboard_rs::ClipboardContext> = if !cli.no_clipboard {
         match clipboard_rs::ClipboardContext::new() {
@@ -66,8 +61,9 @@ pub async fn run(cli: &CliArgs) -> anyhow::Result<()> {
         clipboard::start_watcher(clipboard_tx);
     }
 
-    let (approval_tx, mut approval_rx) = mpsc::unbounded_channel::<(String, bool)>();
+    let (approval_tx, mut approval_rx) = mpsc::unbounded_channel::<(String, String, bool)>();
 
+    println!("Room: {room_name}");
     println!("Waiting for connections...");
 
     loop {
@@ -84,6 +80,7 @@ pub async fn run(cli: &CliArgs) -> anyhow::Result<()> {
                     Some(event) => {
                         handle_network_event(
                             event,
+                            &room_name,
                             &mut core,
                             &network,
                             &clipboard_ctx,
@@ -98,11 +95,11 @@ pub async fn run(cli: &CliArgs) -> anyhow::Result<()> {
                 }
             }
 
-            Some((peer_id, approved)) = approval_rx.recv() => {
+            Some((room, peer_id, approved)) = approval_rx.recv() => {
                 let event = if approved {
-                    BsyncEvent::PeerApproved { id: peer_id }
+                    BsyncEvent::PeerApproved { room, id: peer_id }
                 } else {
-                    BsyncEvent::PeerRejected { id: peer_id }
+                    BsyncEvent::PeerRejected { room, id: peer_id }
                 };
                 let effects = core.process_event(event);
                 for effect in effects {
@@ -127,33 +124,36 @@ pub async fn run(cli: &CliArgs) -> anyhow::Result<()> {
 
 async fn handle_network_event(
     event: NetworkEvent,
+    room: &str,
     core: &mut BsyncCore,
     network: &Network,
     clipboard_ctx: &Option<clipboard_rs::ClipboardContext>,
-    approval_tx: &mpsc::UnboundedSender<(String, bool)>,
+    approval_tx: &mpsc::UnboundedSender<(String, String, bool)>,
 ) -> anyhow::Result<()> {
-    match event {
-        NetworkEvent::MessageReceived { from, content } => {
-            let effects = core.process_event(BsyncEvent::RemoteMessageReceived { from, content });
-            for effect in effects {
-                dispatch_effect(effect, network, clipboard_ctx, approval_tx).await?;
-            }
-        }
-        NetworkEvent::PeerConnected { id } => {
-            let effects = core.process_event(BsyncEvent::PeerConnected { id });
-            for effect in effects {
-                dispatch_effect(effect, network, clipboard_ctx, approval_tx).await?;
-            }
-        }
-        NetworkEvent::PeerDisconnected { id } => {
-            let effects = core.process_event(BsyncEvent::PeerDisconnected { id });
-            for effect in effects {
-                dispatch_effect(effect, network, clipboard_ctx, approval_tx).await?;
-            }
-        }
+    let room = room.to_string();
+    let event = match event {
+        NetworkEvent::MessageReceived { from, content } => BsyncEvent::RemoteMessageReceived {
+            room: room.clone(),
+            from,
+            content,
+        },
+        NetworkEvent::PeerConnected { id } => BsyncEvent::PeerConnected {
+            room: room.clone(),
+            id,
+        },
+        NetworkEvent::PeerDisconnected { id } => BsyncEvent::PeerDisconnected {
+            room: room.clone(),
+            id,
+        },
         NetworkEvent::Lagged => {
             eprintln!("Warning: gossip stream lagged — some clipboard updates were dropped");
+            return Ok(());
         }
+    };
+
+    let effects = core.process_event(event);
+    for effect in effects {
+        dispatch_effect(effect, network, clipboard_ctx, approval_tx).await?;
     }
     Ok(())
 }
@@ -162,7 +162,7 @@ async fn dispatch_effect(
     effect: BsyncEffect,
     network: &Network,
     clipboard_ctx: &Option<clipboard_rs::ClipboardContext>,
-    approval_tx: &mpsc::UnboundedSender<(String, bool)>,
+    approval_tx: &mpsc::UnboundedSender<(String, String, bool)>,
 ) -> anyhow::Result<()> {
     match effect {
         BsyncEffect::WriteClipboard { content, .. } => {
@@ -171,22 +171,25 @@ async fn dispatch_effect(
             }
         }
 
-        BsyncEffect::BroadcastMessage { message } => {
-            match message {
-                GossipMessage::ClipboardText { origin, content } => {
-                    network
-                        .broadcast(&ClipboardContent::Text(content), &origin)
-                        .await?;
-                }
-                GossipMessage::ClipboardImage { .. } => {
-                    // Core emits BroadcastImage for images, not BroadcastMessage.
-                    // This arm is unreachable in practice.
-                    eprintln!("Warning: unexpected BroadcastMessage with image — skipping");
-                }
+        BsyncEffect::BroadcastMessage {
+            room: _room,
+            message,
+        } => match message {
+            GossipMessage::ClipboardText { origin, content } => {
+                network
+                    .broadcast(&ClipboardContent::Text(content), &origin)
+                    .await?;
             }
-        }
+            GossipMessage::ClipboardImage { .. } => {
+                eprintln!("Warning: unexpected BroadcastMessage with image");
+            }
+        },
 
-        BsyncEffect::BroadcastImage { origin, png_data } => {
+        BsyncEffect::BroadcastImage {
+            room: _room,
+            origin,
+            png_data,
+        } => {
             network
                 .broadcast(&ClipboardContent::Image(png_data), &origin)
                 .await?;
@@ -196,26 +199,25 @@ async fn dispatch_effect(
             println!("{message}");
         }
 
-        BsyncEffect::PromptApproval { peer_id } => {
+        BsyncEffect::PromptApproval { room, peer_id } => {
             let tx = approval_tx.clone();
             tokio::task::spawn_blocking(move || {
-                println!("Peer {peer_id} wants to connect. Allow? [y/N]: ");
+                println!("Peer {peer_id} wants to connect in room '{room}'. Allow? [y/N]: ");
                 let mut input = String::new();
                 let approved = std::io::stdin().read_line(&mut input).is_ok()
                     && input.trim().eq_ignore_ascii_case("y");
-                let _ = tx.send((peer_id, approved));
+                let _ = tx.send((room, peer_id, approved));
             });
         }
 
-        BsyncEffect::ConnectToEndpoint { .. } => {}
+        BsyncEffect::SetupRoom { .. }
+        | BsyncEffect::ShutdownRoom { .. }
+        | BsyncEffect::AddPeer { .. } => {
+            // CLI is single-room — these effects are handled at setup time.
+        }
+
         BsyncEffect::Shutdown => {}
     }
 
     Ok(())
-}
-
-fn print_effect(effect: &BsyncEffect) {
-    if let BsyncEffect::PrintStatus { message } = effect {
-        println!("{message}");
-    }
 }

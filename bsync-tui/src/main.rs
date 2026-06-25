@@ -1,16 +1,16 @@
 mod app;
 mod cli;
 mod ui;
-use anyhow::Context;
 
-use bsync_core::{
-    BsyncCore, BsyncEffect, BsyncEvent, ClipboardContent, Config, GossipMessage, Ticket,
-};
+use anyhow::Context;
+use bsync_core::{BsyncCore, BsyncEffect, BsyncEvent, ClipboardContent, Config, GossipMessage};
 use bsync_net::{parse_endpoint_addr, Network, NetworkEvent};
 use bsync_rust::{clipboard, identity};
 use clap::Parser;
 use clipboard_rs::Clipboard;
 use futures_lite::StreamExt;
+use iroh_base::{EndpointId, SecretKey};
+use std::collections::HashMap;
 use tokio::sync::mpsc;
 
 const STARTUP_WARNING: &str = "\
@@ -29,7 +29,7 @@ struct Cli {
     #[arg(short, long)]
     connect: Option<String>,
 
-    /// Room name for logical isolation (default: "default")
+    /// Initial room name (default: "default"). Can add more rooms in the TUI.
     #[arg(long, default_value = "default")]
     room: String,
 
@@ -100,6 +100,97 @@ async fn run_tui(cli: &Cli) -> anyhow::Result<()> {
     result
 }
 
+struct RoomNetworkEvent {
+    room: String,
+    event: NetworkEvent,
+}
+
+struct RoomRegistry {
+    rooms: HashMap<String, RoomHandle>,
+    event_tx: mpsc::UnboundedSender<RoomNetworkEvent>,
+}
+
+struct RoomHandle {
+    network: Network,
+    #[allow(dead_code)]
+    is_local: bool,
+}
+
+impl RoomRegistry {
+    fn new(event_tx: mpsc::UnboundedSender<RoomNetworkEvent>) -> Self {
+        Self {
+            rooms: HashMap::new(),
+            event_tx,
+        }
+    }
+
+    async fn create_room(
+        &mut self,
+        room: &str,
+        secret_key: &SecretKey,
+        bootstrap: Vec<EndpointId>,
+    ) -> anyhow::Result<()> {
+        if self.rooms.contains_key(room) {
+            return Ok(());
+        }
+        let (network, network_rx) = Network::setup(room, secret_key, bootstrap).await?;
+        let tx = self.event_tx.clone();
+        let room_name = room.to_string();
+        tokio::spawn(async move {
+            let mut rx = network_rx;
+            while let Some(event) = rx.recv().await {
+                if tx
+                    .send(RoomNetworkEvent {
+                        room: room_name.clone(),
+                        event,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        self.rooms
+            .insert(room.to_string(), RoomHandle { network, is_local: true });
+        Ok(())
+    }
+
+    async fn remove_room(&mut self, room: &str) -> anyhow::Result<()> {
+        if let Some(handle) = self.rooms.remove(room) {
+            handle.network.shutdown().await?;
+        }
+        Ok(())
+    }
+
+    async fn add_peer(&self, room: &str, endpoint_addr: &str) -> anyhow::Result<()> {
+        let handle = self
+            .rooms
+            .get(room)
+            .ok_or_else(|| anyhow::anyhow!("room '{room}' not found"))?;
+        let peer_id = parse_endpoint_addr(endpoint_addr)?;
+        handle.network.add_peer(peer_id).await
+    }
+
+    async fn broadcast(
+        &self,
+        room: &str,
+        content: &ClipboardContent,
+        origin: &str,
+    ) -> anyhow::Result<()> {
+        let handle = self
+            .rooms
+            .get(room)
+            .ok_or_else(|| anyhow::anyhow!("room '{room}' not found"))?;
+        handle.network.broadcast(content, origin).await
+    }
+
+    async fn shutdown_all(&mut self) {
+        for (_, handle) in self.rooms.drain() {
+            let _ = handle.network.shutdown().await;
+        }
+    }
+}
+
 async fn run_tui_loop(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     room: &str,
@@ -107,14 +198,13 @@ async fn run_tui_loop(
     auto_accept: bool,
     connect_ticket: Option<String>,
 ) -> anyhow::Result<()> {
-    use app::{App, Dialog};
+    use app::App;
     use crossterm::event::{Event, KeyEventKind};
 
     let (secret_key, peer_id_str) = identity::load_or_create_key().await?;
 
     let core = BsyncCore::new(Config {
         peer_id: peer_id_str,
-        room: room.to_string(),
         auto_accept,
     });
     let mut app = App::new(core);
@@ -122,44 +212,39 @@ async fn run_tui_loop(
 
     let _ = app.core.process_event(BsyncEvent::StartEndpoint);
 
-    let mut bootstrap = Vec::new();
-    if let Some(ref ticket_str) = connect_ticket {
-        match Ticket::decode(ticket_str) {
-            Ok(_ticket) => {
-                let effects = app.core.process_event(BsyncEvent::ConnectToPeer {
-                    ticket: ticket_str.clone(),
-                });
-                for effect in effects {
-                    if let BsyncEffect::ConnectToEndpoint { endpoint_addr } = effect {
-                        match parse_endpoint_addr(&endpoint_addr) {
-                            Ok(id) => bootstrap.push(id),
-                            Err(e) => {
-                                app.dialog = Some(Dialog::Error {
-                                    message: format!("Invalid ticket: {e}"),
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                app.dialog = Some(Dialog::Error {
-                    message: format!("Invalid ticket: {e}"),
-                });
-            }
-        }
-    }
+    let (room_event_tx, mut room_event_rx) = mpsc::unbounded_channel::<RoomNetworkEvent>();
+    let mut registry = RoomRegistry::new(room_event_tx);
 
-    let (network, mut network_rx) = Network::setup(room, &secret_key, bootstrap).await?;
-
-    app.clipboard_ctx = if !no_clipboard {
+    // Clipboard context — moved out of app to avoid borrow conflicts.
+    let clipboard_ctx: Option<clipboard_rs::ClipboardContext> = if !no_clipboard {
         clipboard_rs::ClipboardContext::new().ok()
     } else {
         None
     };
 
+    // Create the initial room from --room
+    let init_effects = app
+        .core
+        .process_event(BsyncEvent::CreateRoom {
+            room: room.to_string(),
+        });
+    for effect in init_effects {
+        process_effect(effect, &mut registry, &clipboard_ctx, &mut app, &secret_key).await?;
+    }
+
+    // Handle --connect
+    if let Some(ticket_str) = connect_ticket {
+        let effects = app
+            .core
+            .process_event(BsyncEvent::JoinRoom { ticket: ticket_str });
+        for effect in effects {
+            process_effect(effect, &mut registry, &clipboard_ctx, &mut app, &secret_key)
+                .await?;
+        }
+    }
+
     let (clipboard_tx, mut clipboard_rx) = mpsc::channel::<ClipboardContent>(32);
-    if app.clipboard_ctx.is_some() {
+    if clipboard_ctx.is_some() {
         clipboard::start_watcher(clipboard_tx);
     }
 
@@ -176,9 +261,15 @@ async fn run_tui_loop(
             maybe_event = event_stream.next() => {
                 if let Some(Ok(Event::Key(key))) = maybe_event
                     && key.kind == KeyEventKind::Press {
-                        handle_tui_key(&mut app, key, &network).await?;
+                        handle_tui_key(
+                            &mut app,
+                            key,
+                            &mut registry,
+                            &clipboard_ctx,
+                            &secret_key,
+                        )
+                        .await?;
                     }
-
             }
 
             Some(content) = clipboard_rx.recv() => {
@@ -186,17 +277,26 @@ async fn run_tui_loop(
                     BsyncEvent::LocalClipboardChanged { content }
                 );
                 for effect in effects {
-                    dispatch_effect(effect, &network, &app.clipboard_ctx).await?;
+                    process_effect(
+                        effect,
+                        &mut registry,
+                        &clipboard_ctx,
+                        &mut app,
+                        &secret_key,
+                    )
+                    .await?;
                 }
             }
 
-            event = network_rx.recv() => {
-                match event {
-                    Some(event) => {
-                        handle_network_event_tui(event, &mut app, &network).await?;
-                    }
-                    None => break,
-                }
+            Some(room_event) = room_event_rx.recv() => {
+                handle_network_event_tui(
+                    room_event,
+                    &mut app,
+                    &mut registry,
+                    &clipboard_ctx,
+                    &secret_key,
+                )
+                .await?;
             }
 
             _ = tokio::signal::ctrl_c() => {
@@ -208,20 +308,25 @@ async fn run_tui_loop(
     }
 
     app.core.process_event(BsyncEvent::Shutdown);
-    network.shutdown().await?;
+    registry.shutdown_all().await;
     Ok(())
 }
 
 async fn handle_tui_key(
     app: &mut app::App,
     key: crossterm::event::KeyEvent,
-    network: &Network,
+    registry: &mut RoomRegistry,
+    clipboard_ctx: &Option<clipboard_rs::ClipboardContext>,
+    secret_key: &SecretKey,
 ) -> anyhow::Result<()> {
     use app::Tab;
     use crossterm::event::KeyCode;
 
+    // Clear any transient notification on key press
+    app.notification = None;
+
     if app.dialog.is_some() {
-        return handle_dialog_key(app, key, network).await;
+        return handle_dialog_key(app, key, registry, clipboard_ctx, secret_key).await;
     }
 
     match key.code {
@@ -230,38 +335,75 @@ async fn handle_tui_key(
         KeyCode::BackTab => app.prev_tab(),
         KeyCode::Char('1') => app.tab = Tab::Status,
         KeyCode::Char('2') => app.tab = Tab::Peers,
-        KeyCode::Char('3') => app.tab = Tab::History,
-        KeyCode::Char('4') => app.tab = Tab::Help,
-        KeyCode::Down | KeyCode::Char('j') => app.scroll_history_down(),
-        KeyCode::Up | KeyCode::Char('k') => app.scroll_history_up(),
+        KeyCode::Char('3') => app.tab = Tab::Rooms,
+        KeyCode::Char('4') => app.tab = Tab::History,
+        KeyCode::Char('5') => app.tab = Tab::Help,
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.tab == Tab::History {
+                app.scroll_history_down();
+            } else {
+                app.scroll_rooms_down();
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.tab == Tab::History {
+                app.scroll_history_up();
+            } else {
+                app.scroll_rooms_up();
+            }
+        }
 
-        // Copy your own ticket to clipboard so you can share it
-        KeyCode::Char('t') => app.copy_ticket_to_clipboard(),
+        KeyCode::Char('t') => app.copy_ticket_to_clipboard(clipboard_ctx),
 
         KeyCode::Char('c') => app.open_connect_dialog(),
 
-        // Re-copy a history item to clipboard (Enter on History tab)
-        KeyCode::Enter if app.tab == Tab::History => app.recopy_history_item(),
+        KeyCode::Char('r') | KeyCode::Char('n') => app.open_room_create_dialog(),
+
+        // On Rooms tab: delete or copy ticket for selected room
+        KeyCode::Char('d') if app.tab == Tab::Rooms => {
+            let view = app.view();
+            if let Some(room) = view.rooms.get(app.rooms_scroll) {
+                let room_name = room.name.clone();
+                app.open_room_delete_dialog(room_name);
+            }
+        }
+        KeyCode::Char('T') if app.tab == Tab::Rooms => {
+            let view = app.view();
+            if let Some(room) = view.rooms.get(app.rooms_scroll) {
+                let room_name = room.name.clone();
+                app.copy_room_ticket(&room_name, clipboard_ctx);
+            }
+        }
+
+        KeyCode::Enter if app.tab == Tab::History => app.recopy_history_item(clipboard_ctx),
 
         KeyCode::Char('y') => {
-            let view = app.view();
-            if let Some(peer_id) = view.pending_peers.first() {
-                let effects = app.core.process_event(BsyncEvent::PeerApproved {
-                    id: peer_id.clone(),
-                });
+            let pending = app.view().rooms.iter().find_map(|r| {
+                r.pending_peers
+                    .first()
+                    .map(|id| (r.name.clone(), id.clone()))
+            });
+            if let Some((room, peer_id)) = pending {
+                let effects = app
+                    .core
+                    .process_event(BsyncEvent::PeerApproved { room, id: peer_id });
                 for effect in effects {
-                    dispatch_effect(effect, network, &app.clipboard_ctx).await?;
+                    process_effect(effect, registry, clipboard_ctx, app, secret_key).await?;
                 }
             }
         }
-        KeyCode::Char('n') => {
-            let view = app.view();
-            if let Some(peer_id) = view.pending_peers.first() {
-                let effects = app.core.process_event(BsyncEvent::PeerRejected {
-                    id: peer_id.clone(),
-                });
+        KeyCode::Char('N') if app.tab == Tab::Peers => {
+            let pending = app.view().rooms.iter().find_map(|r| {
+                r.pending_peers
+                    .first()
+                    .map(|id| (r.name.clone(), id.clone()))
+            });
+            if let Some((room, peer_id)) = pending {
+                let effects = app
+                    .core
+                    .process_event(BsyncEvent::PeerRejected { room, id: peer_id });
                 for effect in effects {
-                    dispatch_effect(effect, network, &app.clipboard_ctx).await?;
+                    process_effect(effect, registry, clipboard_ctx, app, secret_key).await?;
                 }
             }
         }
@@ -274,7 +416,9 @@ async fn handle_tui_key(
 async fn handle_dialog_key(
     app: &mut app::App,
     key: crossterm::event::KeyEvent,
-    network: &Network,
+    registry: &mut RoomRegistry,
+    clipboard_ctx: &Option<clipboard_rs::ClipboardContext>,
+    secret_key: &SecretKey,
 ) -> anyhow::Result<()> {
     use app::Dialog;
     use crossterm::event::{KeyCode, KeyModifiers};
@@ -282,25 +426,27 @@ async fn handle_dialog_key(
     let dialog = app.dialog.take().unwrap();
 
     match dialog {
-        Dialog::Approval { peer_id } => match key.code {
+        Dialog::Approval { room, peer_id } => match key.code {
             KeyCode::Char('y') | KeyCode::Enter => {
                 let effects = app
                     .core
-                    .process_event(BsyncEvent::PeerApproved { id: peer_id });
+                    .process_event(BsyncEvent::PeerApproved { room, id: peer_id });
                 for effect in effects {
-                    dispatch_effect(effect, network, &app.clipboard_ctx).await?;
+                    process_effect(effect, registry, clipboard_ctx, app, secret_key).await?;
                 }
             }
             KeyCode::Char('n') => {
                 let effects = app
                     .core
-                    .process_event(BsyncEvent::PeerRejected { id: peer_id });
+                    .process_event(BsyncEvent::PeerRejected { room, id: peer_id });
                 for effect in effects {
-                    dispatch_effect(effect, network, &app.clipboard_ctx).await?;
+                    process_effect(effect, registry, clipboard_ctx, app, secret_key).await?;
                 }
             }
             KeyCode::Esc => {}
-            _ => app.dialog = Some(Dialog::Approval { peer_id }),
+            _ => {
+                app.dialog = Some(Dialog::Approval { room, peer_id });
+            }
         },
 
         Dialog::ConnectInput { mut input } => match key.code {
@@ -310,7 +456,11 @@ async fn handle_dialog_key(
                         message: "Ticket cannot be empty".into(),
                     });
                 } else {
-                    app.connect_to_peer(input, network).await;
+                    let effects = app.core.process_event(BsyncEvent::JoinRoom { ticket: input });
+                    for effect in effects {
+                        process_effect(effect, registry, clipboard_ctx, app, secret_key)
+                            .await?;
+                    }
                 }
             }
             KeyCode::Esc => {}
@@ -319,7 +469,7 @@ async fn handle_dialog_key(
                 app.dialog = Some(Dialog::ConnectInput { input });
             }
             KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(ctx) = &app.clipboard_ctx
+                if let Some(ctx) = clipboard_ctx
                     && let Ok(text) = ctx.get_text()
                 {
                     input.push_str(&text);
@@ -333,6 +483,48 @@ async fn handle_dialog_key(
             _ => app.dialog = Some(Dialog::ConnectInput { input }),
         },
 
+        Dialog::RoomCreate { mut input } => match key.code {
+            KeyCode::Enter => {
+                let trimmed = input.trim().to_string();
+                if trimmed.is_empty() {
+                    app.dialog = Some(Dialog::Error {
+                        message: "Room name cannot be empty".into(),
+                    });
+                } else {
+                    let effects = app
+                        .core
+                        .process_event(BsyncEvent::CreateRoom { room: trimmed });
+                    for effect in effects {
+                        process_effect(effect, registry, clipboard_ctx, app, secret_key)
+                            .await?;
+                    }
+                }
+            }
+            KeyCode::Esc => {}
+            KeyCode::Backspace => {
+                input.pop();
+                app.dialog = Some(Dialog::RoomCreate { input });
+            }
+            KeyCode::Char(c) => {
+                input.push(c);
+                app.dialog = Some(Dialog::RoomCreate { input });
+            }
+            _ => app.dialog = Some(Dialog::RoomCreate { input }),
+        },
+
+        Dialog::RoomDelete { room } => match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                let effects = app.core.process_event(BsyncEvent::LeaveRoom { room });
+                for effect in effects {
+                    process_effect(effect, registry, clipboard_ctx, app, secret_key).await?;
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {}
+            _ => {
+                app.dialog = Some(Dialog::RoomDelete { room });
+            }
+        },
+
         Dialog::Error { .. } | Dialog::Info { .. } => {
             if !matches!(key.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char(' ')) {
                 app.dialog = Some(dialog);
@@ -344,54 +536,53 @@ async fn handle_dialog_key(
 }
 
 async fn handle_network_event_tui(
-    event: NetworkEvent,
+    room_event: RoomNetworkEvent,
     app: &mut app::App,
-    network: &Network,
+    registry: &mut RoomRegistry,
+    clipboard_ctx: &Option<clipboard_rs::ClipboardContext>,
+    secret_key: &SecretKey,
 ) -> anyhow::Result<()> {
     use app::Dialog;
 
-    match event {
-        NetworkEvent::MessageReceived { from, content } => {
-            let effects = app.core.process_event(BsyncEvent::RemoteMessageReceived { from, content });
-            for effect in effects {
-                dispatch_effect(effect, network, &app.clipboard_ctx).await?;
-            }
-        }
-        NetworkEvent::PeerConnected { id } => {
-            let effects = app
-                .core
-                .process_event(BsyncEvent::PeerConnected { id });
-            for effect in effects {
-                if let BsyncEffect::PromptApproval { peer_id } = &effect {
-                    app.dialog = Some(Dialog::Approval {
-                        peer_id: peer_id.clone(),
-                    });
-                }
-                dispatch_effect(effect, network, &app.clipboard_ctx).await?;
-            }
-        }
-        NetworkEvent::PeerDisconnected { id } => {
-            let effects = app
-                .core
-                .process_event(BsyncEvent::PeerDisconnected { id });
-            for effect in effects {
-                dispatch_effect(effect, network, &app.clipboard_ctx).await?;
-            }
-        }
+    let event = match room_event.event {
+        NetworkEvent::MessageReceived { from, content } => BsyncEvent::RemoteMessageReceived {
+            room: room_event.room,
+            from,
+            content,
+        },
+        NetworkEvent::PeerConnected { id } => BsyncEvent::PeerConnected {
+            room: room_event.room,
+            id,
+        },
+        NetworkEvent::PeerDisconnected { id } => BsyncEvent::PeerDisconnected {
+            room: room_event.room,
+            id,
+        },
         NetworkEvent::Lagged => {
             app.dialog = Some(Dialog::Info {
-                message: "Gossip stream lagged — some clipboard updates may have been dropped."
-                    .into(),
+                message: format!(
+                    "[{}] Gossip stream lagged — some clipboard updates may have been dropped.",
+                    room_event.room
+                ),
             });
+            return Ok(());
         }
+    };
+
+    let effects = app.core.process_event(event);
+    for effect in effects {
+        process_effect(effect, registry, clipboard_ctx, app, secret_key).await?;
     }
+
     Ok(())
 }
 
-async fn dispatch_effect(
+async fn process_effect(
     effect: BsyncEffect,
-    network: &Network,
+    registry: &mut RoomRegistry,
     clipboard_ctx: &Option<clipboard_rs::ClipboardContext>,
+    app: &mut app::App,
+    secret_key: &SecretKey,
 ) -> anyhow::Result<()> {
     match effect {
         BsyncEffect::WriteClipboard { content, .. } => {
@@ -399,28 +590,55 @@ async fn dispatch_effect(
                 let _ = bsync_rust::clipboard::write_clipboard(ctx, &content);
             }
         }
-        BsyncEffect::BroadcastMessage { message } => {
-            match message {
-                GossipMessage::ClipboardText { origin, content } => {
-                    network
-                        .broadcast(&ClipboardContent::Text(content), &origin)
-                        .await?;
-                }
-                GossipMessage::ClipboardImage { .. } => {
-                    // Core emits BroadcastImage for images, not BroadcastMessage.
-                    eprintln!("Warning: unexpected BroadcastMessage with image — skipping");
-                }
+
+        BsyncEffect::BroadcastMessage { room, message } => match message {
+            GossipMessage::ClipboardText { origin, content } => {
+                registry
+                    .broadcast(&room, &ClipboardContent::Text(content), &origin)
+                    .await?;
             }
-        }
-        BsyncEffect::BroadcastImage { origin, png_data } => {
-            network
-                .broadcast(&ClipboardContent::Image(png_data), &origin)
+            GossipMessage::ClipboardImage { .. } => {
+                eprintln!("Warning: unexpected BroadcastMessage with image");
+            }
+        },
+
+        BsyncEffect::BroadcastImage {
+            room,
+            origin,
+            png_data,
+        } => {
+            registry
+                .broadcast(&room, &ClipboardContent::Image(png_data), &origin)
                 .await?;
         }
-        BsyncEffect::PrintStatus { .. }
-        | BsyncEffect::PromptApproval { .. }
-        | BsyncEffect::ConnectToEndpoint { .. }
-        | BsyncEffect::Shutdown => {}
+
+        BsyncEffect::PrintStatus { message } => {
+            app.notification = Some(message);
+        }
+
+        BsyncEffect::PromptApproval { room, peer_id } => {
+            app.dialog = Some(app::Dialog::Approval { room, peer_id });
+        }
+
+        BsyncEffect::SetupRoom { room, ticket: _ } => {
+            registry.create_room(&room, secret_key, vec![]).await?;
+        }
+
+        BsyncEffect::ShutdownRoom { room } => {
+            registry.remove_room(&room).await?;
+        }
+
+        BsyncEffect::AddPeer {
+            room,
+            endpoint_addr,
+        } => {
+            registry.add_peer(&room, &endpoint_addr).await?;
+        }
+
+        BsyncEffect::Shutdown => {
+            app.should_quit = true;
+        }
     }
+
     Ok(())
 }
