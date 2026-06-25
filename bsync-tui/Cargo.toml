@@ -10,17 +10,12 @@ path = "src/main.rs"
 
 [dependencies]
 bsync-core = { path = "../bsync-core" }
+bsync-net = { path = "../bsync-net" }
 bsync-rust = { path = "../bsync-rust" }
-iroh = "=1.0.0"
-iroh-gossip = "=0.101.0"
-iroh-blobs = "=0.103.0"
 clipboard-rs = { version = "0.3", features = ["wayland"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "signal", "macros", "io-util", "time"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-dirs = "6"
-blake3 = "1"
-serde_json = "1"
 futures-lite = "2"
 ratatui = "0.30"
 crossterm = { version = "0.29", features = ["event-stream"] }

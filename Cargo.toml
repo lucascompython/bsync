@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["bsync-core", "bsync-rust", "bsync-tui"]
+members = ["bsync-core", "bsync-net", "bsync-rust", "bsync-tui"]
 
 [profile.release]
 codegen-units = 1 # Allows LLVM to perform better optimization.

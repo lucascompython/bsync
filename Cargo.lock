@@ -399,17 +399,29 @@ dependencies = [
 ]
 
 [[package]]
-name = "bsync-rust"
+name = "bsync-net"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
  "bsync-core",
- "clipboard-rs",
- "dirs",
  "iroh",
  "iroh-blobs",
  "iroh-gossip",
+ "n0-future",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "bsync-rust"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bsync-core",
+ "clipboard-rs",
+ "dirs",
+ "iroh-base",
  "tokio",
 ]
 
@@ -418,19 +430,14 @@ name = "bsync-tui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "blake3",
  "bsync-core",
+ "bsync-net",
  "bsync-rust",
  "clap",
  "clipboard-rs",
  "crossterm",
- "dirs",
  "futures-lite",
- "iroh",
- "iroh-blobs",
- "iroh-gossip",
  "ratatui",
- "serde_json",
  "tokio",
 ]
 

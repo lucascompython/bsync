@@ -4,7 +4,5 @@
 // (SwiftUI, Compose, Svelte) — those implement clipboard and identity
 // via native APIs.
 
-pub mod blobs;
 pub mod clipboard;
-pub mod gossip;
 pub mod identity;

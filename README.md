@@ -32,3 +32,13 @@ Wire up the UI frontends, add features like selective sync, file transfer, end-t
 - jetpack compose
 - gtk
 - ratatui
+
+### TODO:
+
+- [ ] does bsync-core have some iroh/p2p logic that needs to be shared across all platforms? i think it does because if not how are we planning on having that networking logic on other platforms? I think maybe all the logic regarding the p2p communication should be shared because i think it can be compiled to all platforms (and then use boltffi where needed), later on we will need to implement encryption for example and auto-discovery and i think it makes sense to have this in only one place
+- [ ] update all rust editions to 2024
+- [ ] make it so you can save someone ticket, then you can change their name, and make them a trusted peer so that you dont have to accept their ticket every time
+- [ ]
+
+1. write a plan to a md file to Promote networking into a shared layer
+2. look into: https://github.com/anchalshivank/iroh-webrtc-transport, since some recent version iroh now support custom transports, and one of their main developers and maintainers created a webrtc one, if this looks good, onthe plan file i asked about before, add information about implementing this

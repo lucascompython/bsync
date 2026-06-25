@@ -1,10 +1,8 @@
-use anyhow::Context;
 use bsync_core::{
-    BsyncCore, BsyncEffect, BsyncEvent, Config, GossipMessage, Ticket, MAX_MESSAGE_SIZE,
+    BsyncCore, BsyncEffect, BsyncEvent, ClipboardContent, Config, GossipMessage, Ticket,
 };
-use bsync_rust::{clipboard, gossip, identity};
-use futures_lite::StreamExt;
-use iroh_gossip::api::Event;
+use bsync_net::{parse_endpoint_addr, Network, NetworkEvent};
+use bsync_rust::{clipboard, identity};
 use tokio::sync::mpsc;
 
 type CliArgs = crate::Cli;
@@ -32,7 +30,7 @@ pub async fn run(cli: &CliArgs) -> anyhow::Result<()> {
                 for effect in effects {
                     match effect {
                         BsyncEffect::ConnectToEndpoint { endpoint_addr } => {
-                            match gossip::parse_endpoint_addr(&endpoint_addr) {
+                            match parse_endpoint_addr(&endpoint_addr) {
                                 Ok(id) => bootstrap.push(id),
                                 Err(e) => eprintln!("Invalid endpoint address in ticket: {e}"),
                             }
@@ -45,7 +43,7 @@ pub async fn run(cli: &CliArgs) -> anyhow::Result<()> {
         }
     }
 
-    let mut gh = gossip::setup(&cli.room, &secret_key, bootstrap).await?;
+    let (network, mut network_rx) = Network::setup(&cli.room, &secret_key, bootstrap).await?;
 
     let clipboard_ctx: Option<clipboard_rs::ClipboardContext> = if !cli.no_clipboard {
         match clipboard_rs::ClipboardContext::new() {
@@ -63,7 +61,7 @@ pub async fn run(cli: &CliArgs) -> anyhow::Result<()> {
         None
     };
 
-    let (clipboard_tx, mut clipboard_rx) = mpsc::channel::<bsync_core::ClipboardContent>(32);
+    let (clipboard_tx, mut clipboard_rx) = mpsc::channel::<ClipboardContent>(32);
     if clipboard_ctx.is_some() {
         clipboard::start_watcher(clipboard_tx);
     }
@@ -77,20 +75,24 @@ pub async fn run(cli: &CliArgs) -> anyhow::Result<()> {
             Some(content) = clipboard_rx.recv() => {
                 let effects = core.process_event(BsyncEvent::LocalClipboardChanged { content });
                 for effect in effects {
-                    dispatch_effect(effect, &gh, &clipboard_ctx, &approval_tx).await?;
+                    dispatch_effect(effect, &network, &clipboard_ctx, &approval_tx).await?;
                 }
             }
 
-            result = gh.receiver.next() => {
-                match result {
-                    Some(Ok(event)) => {
-                        handle_gossip_event(event, &mut core, &gh, &clipboard_ctx, &approval_tx).await?;
-                    }
-                    Some(Err(e)) => {
-                        eprintln!("Gossip error: {e}");
+            event = network_rx.recv() => {
+                match event {
+                    Some(event) => {
+                        handle_network_event(
+                            event,
+                            &mut core,
+                            &network,
+                            &clipboard_ctx,
+                            &approval_tx,
+                        )
+                        .await?;
                     }
                     None => {
-                        eprintln!("Gossip stream ended");
+                        eprintln!("Network stream ended");
                         break;
                     }
                 }
@@ -104,7 +106,7 @@ pub async fn run(cli: &CliArgs) -> anyhow::Result<()> {
                 };
                 let effects = core.process_event(event);
                 for effect in effects {
-                    dispatch_effect(effect, &gh, &clipboard_ctx, &approval_tx).await?;
+                    dispatch_effect(effect, &network, &clipboard_ctx, &approval_tx).await?;
                 }
             }
 
@@ -112,72 +114,44 @@ pub async fn run(cli: &CliArgs) -> anyhow::Result<()> {
                 println!("\nShutting down...");
                 let effects = core.process_event(BsyncEvent::Shutdown);
                 for effect in effects {
-                    dispatch_effect(effect, &gh, &clipboard_ctx, &approval_tx).await?;
+                    dispatch_effect(effect, &network, &clipboard_ctx, &approval_tx).await?;
                 }
                 break;
             }
         }
     }
 
-    gh.router.shutdown().await.context("shutdown router")?;
+    network.shutdown().await?;
     Ok(())
 }
 
-async fn handle_gossip_event(
-    event: Event,
+async fn handle_network_event(
+    event: NetworkEvent,
     core: &mut BsyncCore,
-    gh: &gossip::GossipHandle,
+    network: &Network,
     clipboard_ctx: &Option<clipboard_rs::ClipboardContext>,
     approval_tx: &mpsc::UnboundedSender<(String, bool)>,
 ) -> anyhow::Result<()> {
     match event {
-        Event::Received(msg) => match serde_json::from_slice::<GossipMessage>(&msg.content) {
-            Ok(gm) => {
-                let (origin, content) = match gm {
-                    GossipMessage::ClipboardText { origin, content } => {
-                        (origin, bsync_core::ClipboardContent::Text(content))
-                    }
-                    GossipMessage::ClipboardImage { origin, hash } => {
-                        let hash = iroh_blobs::Hash::from_bytes(hash);
-                        let from: iroh::EndpointId = origin
-                            .parse()
-                            .context("invalid origin endpoint id in image message")?;
-                        match gh.blobs.download(hash, from, &gh.endpoint).await {
-                            Ok(png_data) => {
-                                (origin, bsync_core::ClipboardContent::Image(png_data))
-                            }
-                            Err(e) => {
-                                eprintln!("Image download failed: {e}");
-                                return Ok(());
-                            }
-                        }
-                    }
-                };
-                let effects = core.process_event(BsyncEvent::RemoteMessageReceived {
-                    from: origin,
-                    content,
-                });
-                for effect in effects {
-                    dispatch_effect(effect, gh, clipboard_ctx, approval_tx).await?;
-                }
-            }
-            Err(e) => {
-                eprintln!("Failed to deserialize gossip message: {e}");
-            }
-        },
-        Event::NeighborUp(id) => {
-            let effects = core.process_event(BsyncEvent::PeerConnected { id: id.to_string() });
+        NetworkEvent::MessageReceived { from, content } => {
+            let effects = core.process_event(BsyncEvent::RemoteMessageReceived { from, content });
             for effect in effects {
-                dispatch_effect(effect, gh, clipboard_ctx, approval_tx).await?;
+                dispatch_effect(effect, network, clipboard_ctx, approval_tx).await?;
             }
         }
-        Event::NeighborDown(id) => {
-            let effects = core.process_event(BsyncEvent::PeerDisconnected { id: id.to_string() });
+        NetworkEvent::PeerConnected { id } => {
+            let effects = core.process_event(BsyncEvent::PeerConnected { id });
             for effect in effects {
-                dispatch_effect(effect, gh, clipboard_ctx, approval_tx).await?;
+                dispatch_effect(effect, network, clipboard_ctx, approval_tx).await?;
             }
         }
-        Event::Lagged => {
+        NetworkEvent::PeerDisconnected { id } => {
+            let effects = core.process_event(BsyncEvent::PeerDisconnected { id });
+            for effect in effects {
+                dispatch_effect(effect, network, clipboard_ctx, approval_tx).await?;
+            }
+        }
+        NetworkEvent::Lagged => {
             eprintln!("Warning: gossip stream lagged — some clipboard updates were dropped");
         }
     }
@@ -186,7 +160,7 @@ async fn handle_gossip_event(
 
 async fn dispatch_effect(
     effect: BsyncEffect,
-    gh: &gossip::GossipHandle,
+    network: &Network,
     clipboard_ctx: &Option<clipboard_rs::ClipboardContext>,
     approval_tx: &mpsc::UnboundedSender<(String, bool)>,
 ) -> anyhow::Result<()> {
@@ -198,31 +172,24 @@ async fn dispatch_effect(
         }
 
         BsyncEffect::BroadcastMessage { message } => {
-            let payload = serde_json::to_vec(&message)?;
-            if payload.len() > MAX_MESSAGE_SIZE {
-                eprintln!(
-                    "Message too large ({} bytes). Skipping sync.",
-                    payload.len()
-                );
-                return Ok(());
+            match message {
+                GossipMessage::ClipboardText { origin, content } => {
+                    network
+                        .broadcast(&ClipboardContent::Text(content), &origin)
+                        .await?;
+                }
+                GossipMessage::ClipboardImage { .. } => {
+                    // Core emits BroadcastImage for images, not BroadcastMessage.
+                    // This arm is unreachable in practice.
+                    eprintln!("Warning: unexpected BroadcastMessage with image — skipping");
+                }
             }
-            gh.sender.broadcast(payload.into()).await?;
         }
 
         BsyncEffect::BroadcastImage { origin, png_data } => {
-            match gh.blobs.add(&png_data).await {
-                Ok(hash) => {
-                    let message = GossipMessage::ClipboardImage {
-                        origin,
-                        hash: *hash.as_bytes(),
-                    };
-                    let payload = serde_json::to_vec(&message)?;
-                    gh.sender.broadcast(payload.into()).await?;
-                }
-                Err(e) => {
-                    eprintln!("Failed to add image blob: {e}");
-                }
-            }
+            network
+                .broadcast(&ClipboardContent::Image(png_data), &origin)
+                .await?;
         }
 
         BsyncEffect::PrintStatus { message } => {

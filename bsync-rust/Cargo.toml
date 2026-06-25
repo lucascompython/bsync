@@ -2,7 +2,7 @@
 name = "bsync-rust"
 version = "0.1.0"
 edition = "2024"
-description = "Shared Rust platform implementation for bsync shells (identity, gossip, clipboard)"
+description = "Shared Rust platform I/O for bsync shells (clipboard + filesystem identity)"
 
 [lib]
 name = "bsync_rust"
@@ -10,11 +10,8 @@ path = "src/lib.rs"
 
 [dependencies]
 bsync-core = { path = "../bsync-core" }
-iroh = "=1.0.0"
-iroh-gossip = "=0.101.0"
-iroh-blobs = "=0.103.0"
+iroh-base = { version = "=1.0.0", features = ["key"] }
 clipboard-rs = { version = "0.3", features = ["wayland"] }
-tokio = { version = "1", features = ["sync", "fs", "io-util"] }
+tokio = { version = "1", features = ["sync", "fs"] }
 anyhow = "1"
 dirs = "6"
-blake3 = "1"

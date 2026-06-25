@@ -2,7 +2,7 @@
 // Key stored at ~/.config/bsync/identity.key with 0o600 permissions.
 
 use anyhow::Context;
-use iroh::SecretKey;
+use iroh_base::SecretKey;
 use std::path::PathBuf;
 
 /// Load existing key from disk, or generate + persist a new one.
@@ -26,7 +26,7 @@ async fn load_key(key_path: &PathBuf) -> anyhow::Result<(SecretKey, String)> {
         .try_into()
         .map_err(|_| anyhow::anyhow!("identity key file is corrupt: expected 32 bytes"))?;
     let secret_key = SecretKey::from_bytes(&bytes);
-    let peer_id = iroh::EndpointId::from(secret_key.public()).to_string();
+    let peer_id = iroh_base::EndpointId::from(secret_key.public()).to_string();
     Ok((secret_key, peer_id))
 }
 
@@ -61,7 +61,7 @@ async fn create_key(
             .context("failed to set key file permissions")?;
     }
 
-    let peer_id = iroh::EndpointId::from(secret_key.public()).to_string();
+    let peer_id = iroh_base::EndpointId::from(secret_key.public()).to_string();
     Ok((secret_key, peer_id))
 }
 

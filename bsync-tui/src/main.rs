@@ -1,16 +1,16 @@
 mod app;
 mod cli;
 mod ui;
-
 use anyhow::Context;
+
 use bsync_core::{
-    BsyncCore, BsyncEffect, BsyncEvent, Config, GossipMessage, MAX_MESSAGE_SIZE, Ticket,
+    BsyncCore, BsyncEffect, BsyncEvent, ClipboardContent, Config, GossipMessage, Ticket,
 };
-use bsync_rust::{clipboard, gossip, identity};
+use bsync_net::{parse_endpoint_addr, Network, NetworkEvent};
+use bsync_rust::{clipboard, identity};
 use clap::Parser;
 use clipboard_rs::Clipboard;
 use futures_lite::StreamExt;
-use iroh_gossip::api::Event as GossipEvent;
 use tokio::sync::mpsc;
 
 const STARTUP_WARNING: &str = "\
@@ -117,7 +117,7 @@ async fn run_tui_loop(
         room: room.to_string(),
         auto_accept,
     });
-    let mut app = App::new(core, room.to_string());
+    let mut app = App::new(core);
     app.clipboard_enabled = !no_clipboard;
 
     let _ = app.core.process_event(BsyncEvent::StartEndpoint);
@@ -131,7 +131,7 @@ async fn run_tui_loop(
                 });
                 for effect in effects {
                     if let BsyncEffect::ConnectToEndpoint { endpoint_addr } = effect {
-                        match gossip::parse_endpoint_addr(&endpoint_addr) {
+                        match parse_endpoint_addr(&endpoint_addr) {
                             Ok(id) => bootstrap.push(id),
                             Err(e) => {
                                 app.dialog = Some(Dialog::Error {
@@ -150,16 +150,15 @@ async fn run_tui_loop(
         }
     }
 
-    let mut gh = gossip::setup(room, &secret_key, bootstrap).await?;
+    let (network, mut network_rx) = Network::setup(room, &secret_key, bootstrap).await?;
 
     app.clipboard_ctx = if !no_clipboard {
         clipboard_rs::ClipboardContext::new().ok()
     } else {
         None
     };
-    app.gossip = Some(gh.gossip.clone());
 
-    let (clipboard_tx, mut clipboard_rx) = mpsc::channel::<bsync_core::ClipboardContent>(32);
+    let (clipboard_tx, mut clipboard_rx) = mpsc::channel::<ClipboardContent>(32);
     if app.clipboard_ctx.is_some() {
         clipboard::start_watcher(clipboard_tx);
     }
@@ -177,7 +176,7 @@ async fn run_tui_loop(
             maybe_event = event_stream.next() => {
                 if let Some(Ok(Event::Key(key))) = maybe_event
                     && key.kind == KeyEventKind::Press {
-                        handle_tui_key(&mut app, key, &gh).await?;
+                        handle_tui_key(&mut app, key, &network).await?;
                     }
 
             }
@@ -187,19 +186,14 @@ async fn run_tui_loop(
                     BsyncEvent::LocalClipboardChanged { content }
                 );
                 for effect in effects {
-                    dispatch_effect(effect, &gh, &app.clipboard_ctx).await?;
+                    dispatch_effect(effect, &network, &app.clipboard_ctx).await?;
                 }
             }
 
-            result = gh.receiver.next() => {
-                match result {
-                    Some(Ok(event)) => {
-                        handle_gossip_event_tui(event, &mut app, &gh).await?;
-                    }
-                    Some(Err(e)) => {
-                        app.dialog = Some(Dialog::Error {
-                            message: format!("Gossip error: {e}"),
-                        });
+            event = network_rx.recv() => {
+                match event {
+                    Some(event) => {
+                        handle_network_event_tui(event, &mut app, &network).await?;
                     }
                     None => break,
                 }
@@ -214,20 +208,20 @@ async fn run_tui_loop(
     }
 
     app.core.process_event(BsyncEvent::Shutdown);
-    gh.router.shutdown().await.context("shutdown router")?;
+    network.shutdown().await?;
     Ok(())
 }
 
 async fn handle_tui_key(
     app: &mut app::App,
     key: crossterm::event::KeyEvent,
-    gh: &gossip::GossipHandle,
+    network: &Network,
 ) -> anyhow::Result<()> {
     use app::Tab;
     use crossterm::event::KeyCode;
 
     if app.dialog.is_some() {
-        return handle_dialog_key(app, key, gh).await;
+        return handle_dialog_key(app, key, network).await;
     }
 
     match key.code {
@@ -256,7 +250,7 @@ async fn handle_tui_key(
                     id: peer_id.clone(),
                 });
                 for effect in effects {
-                    dispatch_effect(effect, gh, &app.clipboard_ctx).await?;
+                    dispatch_effect(effect, network, &app.clipboard_ctx).await?;
                 }
             }
         }
@@ -267,7 +261,7 @@ async fn handle_tui_key(
                     id: peer_id.clone(),
                 });
                 for effect in effects {
-                    dispatch_effect(effect, gh, &app.clipboard_ctx).await?;
+                    dispatch_effect(effect, network, &app.clipboard_ctx).await?;
                 }
             }
         }
@@ -280,7 +274,7 @@ async fn handle_tui_key(
 async fn handle_dialog_key(
     app: &mut app::App,
     key: crossterm::event::KeyEvent,
-    gh: &gossip::GossipHandle,
+    network: &Network,
 ) -> anyhow::Result<()> {
     use app::Dialog;
     use crossterm::event::{KeyCode, KeyModifiers};
@@ -294,7 +288,7 @@ async fn handle_dialog_key(
                     .core
                     .process_event(BsyncEvent::PeerApproved { id: peer_id });
                 for effect in effects {
-                    dispatch_effect(effect, gh, &app.clipboard_ctx).await?;
+                    dispatch_effect(effect, network, &app.clipboard_ctx).await?;
                 }
             }
             KeyCode::Char('n') => {
@@ -302,7 +296,7 @@ async fn handle_dialog_key(
                     .core
                     .process_event(BsyncEvent::PeerRejected { id: peer_id });
                 for effect in effects {
-                    dispatch_effect(effect, gh, &app.clipboard_ctx).await?;
+                    dispatch_effect(effect, network, &app.clipboard_ctx).await?;
                 }
             }
             KeyCode::Esc => {}
@@ -316,7 +310,7 @@ async fn handle_dialog_key(
                         message: "Ticket cannot be empty".into(),
                     });
                 } else {
-                    app.connect_to_peer(input).await;
+                    app.connect_to_peer(input, network).await;
                 }
             }
             KeyCode::Esc => {}
@@ -349,69 +343,42 @@ async fn handle_dialog_key(
     Ok(())
 }
 
-async fn handle_gossip_event_tui(
-    event: GossipEvent,
+async fn handle_network_event_tui(
+    event: NetworkEvent,
     app: &mut app::App,
-    gh: &gossip::GossipHandle,
+    network: &Network,
 ) -> anyhow::Result<()> {
     use app::Dialog;
 
     match event {
-        GossipEvent::Received(msg) => {
-            if let Ok(gm) = serde_json::from_slice::<GossipMessage>(&msg.content) {
-                let (origin, content) = match gm {
-                    GossipMessage::ClipboardText { origin, content } => {
-                        (origin, bsync_core::ClipboardContent::Text(content))
-                    }
-                    GossipMessage::ClipboardImage { origin, hash } => {
-                        let hash = iroh_blobs::Hash::from_bytes(hash);
-                        let from: iroh::EndpointId = origin
-                            .parse()
-                            .context("invalid origin endpoint id in image message")?;
-                        match gh.blobs.download(hash, from, &gh.endpoint).await {
-                            Ok(png_data) => {
-                                (origin, bsync_core::ClipboardContent::Image(png_data))
-                            }
-                            Err(e) => {
-                                app.dialog = Some(Dialog::Error {
-                                    message: format!("Image download failed: {e}"),
-                                });
-                                return Ok(());
-                            }
-                        }
-                    }
-                };
-                let effects = app.core.process_event(BsyncEvent::RemoteMessageReceived {
-                    from: origin,
-                    content,
-                });
-                for effect in effects {
-                    dispatch_effect(effect, gh, &app.clipboard_ctx).await?;
-                }
+        NetworkEvent::MessageReceived { from, content } => {
+            let effects = app.core.process_event(BsyncEvent::RemoteMessageReceived { from, content });
+            for effect in effects {
+                dispatch_effect(effect, network, &app.clipboard_ctx).await?;
             }
         }
-        GossipEvent::NeighborUp(id) => {
+        NetworkEvent::PeerConnected { id } => {
             let effects = app
                 .core
-                .process_event(BsyncEvent::PeerConnected { id: id.to_string() });
+                .process_event(BsyncEvent::PeerConnected { id });
             for effect in effects {
                 if let BsyncEffect::PromptApproval { peer_id } = &effect {
                     app.dialog = Some(Dialog::Approval {
                         peer_id: peer_id.clone(),
                     });
                 }
-                dispatch_effect(effect, gh, &app.clipboard_ctx).await?;
+                dispatch_effect(effect, network, &app.clipboard_ctx).await?;
             }
         }
-        GossipEvent::NeighborDown(id) => {
+        NetworkEvent::PeerDisconnected { id } => {
             let effects = app
                 .core
-                .process_event(BsyncEvent::PeerDisconnected { id: id.to_string() });
+                .process_event(BsyncEvent::PeerDisconnected { id });
             for effect in effects {
-                dispatch_effect(effect, gh, &app.clipboard_ctx).await?;
+                dispatch_effect(effect, network, &app.clipboard_ctx).await?;
             }
         }
-        GossipEvent::Lagged => {
+        NetworkEvent::Lagged => {
             app.dialog = Some(Dialog::Info {
                 message: "Gossip stream lagged — some clipboard updates may have been dropped."
                     .into(),
@@ -423,7 +390,7 @@ async fn handle_gossip_event_tui(
 
 async fn dispatch_effect(
     effect: BsyncEffect,
-    gh: &gossip::GossipHandle,
+    network: &Network,
     clipboard_ctx: &Option<clipboard_rs::ClipboardContext>,
 ) -> anyhow::Result<()> {
     match effect {
@@ -433,27 +400,22 @@ async fn dispatch_effect(
             }
         }
         BsyncEffect::BroadcastMessage { message } => {
-            let payload = serde_json::to_vec(&message)?;
-            if payload.len() <= MAX_MESSAGE_SIZE {
-                gh.sender.broadcast(payload.into()).await?;
+            match message {
+                GossipMessage::ClipboardText { origin, content } => {
+                    network
+                        .broadcast(&ClipboardContent::Text(content), &origin)
+                        .await?;
+                }
+                GossipMessage::ClipboardImage { .. } => {
+                    // Core emits BroadcastImage for images, not BroadcastMessage.
+                    eprintln!("Warning: unexpected BroadcastMessage with image — skipping");
+                }
             }
         }
         BsyncEffect::BroadcastImage { origin, png_data } => {
-            // Upload PNG bytes to the blob store, then broadcast just the hash over gossip.
-            // The hash is 32 bytes — tiny compared to the raw PNG data.
-            match gh.blobs.add(&png_data).await {
-                Ok(hash) => {
-                    let message = GossipMessage::ClipboardImage {
-                        origin,
-                        hash: *hash.as_bytes(),
-                    };
-                    let payload = serde_json::to_vec(&message)?;
-                    gh.sender.broadcast(payload.into()).await?;
-                }
-                Err(e) => {
-                    return Err(anyhow::anyhow!("failed to add image blob: {e}"));
-                }
-            }
+            network
+                .broadcast(&ClipboardContent::Image(png_data), &origin)
+                .await?;
         }
         BsyncEffect::PrintStatus { .. }
         | BsyncEffect::PromptApproval { .. }
