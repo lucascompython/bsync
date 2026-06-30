@@ -38,4 +38,3 @@ Enter the app -> get your peer ID -> share your peer ID with others -> connect t
 - [ ] persisent configuration, using sqlite or libsql or turso to save peer information, rooms, settings, etc.
 - [ ] look into: https://github.com/anchalshivank/iroh-webrtc-transport,
 - [ ] look into making the identity.rs stuff in bsync-rust more cross-platform, there is no need to repeat some of the code there in native platform code, basically in all platforms we will be reading the same files in the same places, we can keep it in the bsync-net
-- see torrent transport
